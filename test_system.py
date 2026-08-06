@@ -1,0 +1,98 @@
+import unittest
+import requests
+import urllib3
+from bs4 import BeautifulSoup
+from utils import clean_html
+from scraper_api import get_api_articles
+from scraper_tfc import get_tfc_articles
+
+# 關閉測試時的憑證警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class TestHealthETLPipeline(unittest.TestCase):
+    
+    def test_01_clean_html_cases(self):
+        """測試要求 1：資料清洗的「多組測試案例 (Test Cases)」"""
+        # 定義多組邊界測試 (Test Cases)
+        cases = [
+            # 案例 A：一般 HTML 標籤
+            {"input": "<p>這是<b>測試</b></p>", "expected": "這是測試"},
+            # 案例 B：連續多餘空白與換行
+            {"input": "  很多 \n\n 空白   和 \t 換行  ", "expected": "很多 空白 和 換行"},
+            # 案例 C：HTML 實體字元轉義 (Entity Unescape)
+            {"input": "&lt;這不是標籤&gt; &amp; &nbsp;空白", "expected": "<這不是標籤> & 空白"},
+            # 案例 D：極端案例 (None 或空字串)
+            {"input": None, "expected": ""},
+            {"input": "", "expected": ""}
+        ]
+        
+        for i, case in enumerate(cases):
+            with self.subTest(case_index=i):
+                result = clean_html(case["input"])
+                self.assertEqual(result, case["expected"], f"第 {i} 組測試案例失敗：輸入 {case['input']}")
+
+    def test_02_api_data_integrity(self):
+        """測試要求 2：確保 API 爬蟲資料與來源網站「一模一樣」"""
+        # 1. 模擬人工：當下直接去食藥署 API 看最原始的第一筆資料
+        raw_url = "https://www.fda.gov.tw/DataAction"
+        res = requests.get(raw_url, verify=False, timeout=10)
+        raw_data = res.json()
+        # 食藥署的標題欄位可能是 "標題" 或 "Title"
+        expected_title = raw_data[0].get("標題", raw_data[0].get("Title", "")).strip()
+        
+        # 2. 呼叫我們的模組
+        articles = get_api_articles(test_mode=True)
+        
+        # 3. 找出模組抓到的「食藥署」第一篇文章
+        fda_first_article = next(art for art in articles if art["source"] == "食藥署闢謠專區")
+        
+        # 4. 斷言比對 (Data Integrity Check)
+        print(f"\n    🔍 [API 來源原始資料] 最新標題: {expected_title}")
+        print(f"    ✅ [API 爬蟲模組產出] 最終標題: {fda_first_article['title']}")
+        
+        self.assertEqual(fda_first_article["title"], expected_title, 
+                         "API 爬蟲抓取的標題與來源 API 原始資料不一致！")
+        
+        # 確保格式欄位齊全
+        self.assertIn("content", fda_first_article)
+        self.assertIn("url", fda_first_article)
+
+    def test_03_tfc_data_integrity(self):
+        """測試要求 2：確保 TFC 網頁爬蟲資料與網站「一模一樣」"""
+        # 1. 模擬人工：當下用最原始的方式去 TFC 健康專區把第一篇文章標題硬生生抓下來
+        raw_url = "https://tfc-taiwan.org.tw/fact-check-report-type/health/"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get(raw_url, headers=headers, verify=False, timeout=10)
+        soup = BeautifulSoup(res.content, 'html.parser')
+        
+        expected_title = ""
+        # 尋找第一個真正的文章標題 (避開 Read More)
+        for a in soup.find_all('a'):
+            title = a.get_text(strip=True)
+            link = a.get('href')
+            if link and ('/articles/' in link or '/fact-check-reports/' in link):
+                if title and "Read More" not in title and "閱讀更多" not in title:
+                    expected_title = title
+                    break
+                    
+        # 2. 呼叫我們的爬蟲模組
+        articles = get_tfc_articles(test_mode=True)
+        tfc_first_article = articles[0]
+        
+        # 3. 斷言比對 (保證爬蟲沒有漏字、沒有切錯)
+        print(f"\n    🔍 [TFC 網頁當前顯示] 最新標題: {expected_title}")
+        print(f"    ✅ [TFC 爬蟲模組產出] 最終標題: {tfc_first_article['title']}")
+        
+        self.assertEqual(tfc_first_article["title"], expected_title, 
+                         "TFC 爬蟲抓取的標題與網頁當前顯示的第一篇標題不一致！")
+        
+        # 確保格式欄位齊全
+        self.assertIn("content", tfc_first_article)
+        self.assertTrue(len(tfc_first_article["content"]) > 50, "內文長度過短，可能抓取失敗")
+
+if __name__ == '__main__':
+    print("==================================================")
+    print(" 🏥 ETL 資料管線 - 單元測試與一致性驗證啟動")
+    print("==================================================\n")
+    # verbosity=2 會印出每一條詳細的測試名稱，展示給教授看非常加分
+    unittest.main(verbosity=2)

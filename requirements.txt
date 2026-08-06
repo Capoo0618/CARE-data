@@ -1,0 +1,6 @@
+requests2.31.0
+beautifulsoup44.12.3
+pymongo4.6.2
+python-dotenv1.0.1
+schedule1.2.1
+urllib32.2.1
