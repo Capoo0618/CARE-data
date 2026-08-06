@@ -18,15 +18,14 @@ schedule:
 jobs:
 run-etl:
 runs-on: ubuntu-latest
-
 steps:
-  # 步驟 1：把你的程式碼從 GitHub 抓下來到虛擬機上
-  - name: Checkout Code
-    uses: actions/checkout@v3
+# 步驟 1：把你的程式碼從 GitHub 抓下來到虛擬機上
+- name: Checkout Code
+uses: actions/checkout@v4
 
   # 步驟 2：在虛擬機上安裝 Python 環境
   - name: Set up Python
-    uses: actions/setup-python@v4
+    uses: actions/setup-python@v5
     with:
       python-version: '3.10'
 
