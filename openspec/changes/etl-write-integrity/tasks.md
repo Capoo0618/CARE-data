@@ -1,7 +1,7 @@
 ## 1. 寫入改為全有或全無，去重降到文章粒度
 
 - [x] 1.1 `main_pipeline.py`：`upload_to_mongodb` 改為先確認一篇文章的**所有** chunk 都成功取得向量後，才以單次批次寫入該篇；任一 chunk 向量化失敗時，該篇 0 個 chunk 被寫入，並保留在未寫入狀態以待下次執行重試
-- [x] 1.2 `main_pipeline.py`：去重判定粒度由「來源」改為「文章」——一次以 `collection.distinct()` 取回既有的 url／title 鍵值集合，取代逐篇 `find_one` 的 N 次資料庫往返；移除 `skipped_sources` 機制，單篇已存在不得再導致同來源後續文章被跳過
+- [x] 1.2 `main_pipeline.py`：去重判定粒度由「來源」改為「文章」——一次以 `collection.distinct()` 取回既有的 url／title 鍵值集合供去重比對（改版偵測與完整性檢查仍逐篇查詢，見 design.md 的 D2）；移除 `skipped_sources` 機制，單篇已存在不得再導致同來源後續文章被跳過
 - [x] 1.3 `upload_to_mongodb` 對外部呼叫（向量化）新增依賴注入介面，供測試以假件取代真實 API
 - [x] 1.4 測試（純函式／寫入邏輯單元測試——依賴注入假件，不得發出真實網路請求）：`test_system.py` 新增 `test_04_partial_embedding_failure_writes_nothing`、`test_05_all_chunks_succeed_writes_once`、`test_06_existing_article_does_not_skip_rest_of_source`
 
@@ -32,7 +32,7 @@
 
 ## 5. Definition of Done
 
-- [x] 5.1 `python test_system.py` 全綠，共 18 個測試（含 `test_02`／`test_03` 的線上一致性驗證，執行時需要網路連線）
+- [x] 5.1 `python test_system.py` 全綠，共 24 個測試（含 `test_02`／`test_03` 的線上一致性驗證，執行時需要網路連線）
 - [x] 5.2 有清楚的 git commit；本 change 對下游 CARE Backend 影響極小且不需 cutover——
   不改變 `chunk_content` 內容或 embedding 產生方式，既有向量完全有效；既有文件會新增
   `published_at` / `updated_at` 兩個欄位，並一次性重寫 71 篇既有的不完整文章（詳見 proposal.md）
@@ -56,3 +56,20 @@
   不再依賴從 repo 根目錄執行
 - [x] 7.5 測試：新增既有資料補日期、破洞修復、單篇寫入失敗不中止整批、
   同批次重複文章只寫一次、改版空內容不刪舊版等情境
+
+## 8. 對抗式驗證後的修正
+
+- [x] 8.1 `main_pipeline.py`：`insert_many` 中途失敗時清除該篇殘留的切片
+  （見 design.md 的 D8）
+- [x] 8.2 `main_pipeline.py`：完整性檢查改為每次執行都跑，不再只在尚未補日期的
+  文章上（見 design.md 的 D7）
+- [x] 8.3 `main_pipeline.py`：「有嘗試但一篇都沒成功」時回報失敗，讓退出碼為 1
+  （見 design.md 的 D9）
+- [x] 8.4 `main_pipeline.py`：`existing_titles` 改用 `is not None` 判斷，
+  空字串標題不再每次執行重複寫入；`scraper_api.py` 的守衛由 `and` 改為 `or`，
+  標題或內容任一為空的記錄不進入管線
+- [x] 8.5 測試：新增 `test_20_partial_insert_is_rolled_back`、
+  `test_21_hole_is_repaired_even_after_updated_at_is_set`、
+  `test_22_systematic_embedding_failure_is_reported`、
+  `test_23_single_embedding_failure_does_not_fail_the_run`、
+  `test_24_empty_title_article_is_written_at_most_once`

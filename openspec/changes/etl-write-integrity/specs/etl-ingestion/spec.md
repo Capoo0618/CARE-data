@@ -41,3 +41,33 @@
 
 - **WHEN** MongoDB 連線或寫入拋出例外
 - **THEN** 該次執行以非零狀態碼結束
+
+### Requirement: 寫入中途失敗不得留下殘骸
+
+當一篇文章的寫入在中途失敗（`insert_many` 預設 `ordered=True`，已寫入的文件不會回滾）時，系統 SHALL 清除該篇殘留的所有 chunk，使該篇於知識庫中不存在，並於下次執行以全新文章重新寫入。系統 SHALL NOT 讓宣告的 `total_chunks` 與實際筆數不符的文件留在知識庫中。
+
+系統 SHALL 於每次執行檢查既有文章的實際 chunk 數是否與其宣告的 `total_chunks` 相符，不符者 SHALL 重寫修復。此檢查 SHALL NOT 僅在文章尚未具備 `updated_at` 時進行。
+
+#### Scenario: 寫入寫到一半失敗
+
+- **WHEN** 某篇文章切出 3 個 chunk，`insert_many` 寫入前 2 筆後拋出例外
+- **THEN** 該篇在知識庫中的 chunk 數為 0，且該次執行以非零狀態碼結束
+
+#### Scenario: 已具備修改日期的破洞仍會被修復
+
+- **WHEN** 某篇文章已有 `updated_at`，且其實際 chunk 數少於宣告的 `total_chunks`
+- **THEN** 系統重寫該篇，且重寫後 `total_chunks` 與實際筆數一致
+
+### Requirement: 系統性向量化失敗必須可見
+
+當一次執行中有文章進入向量化階段，但沒有任何一篇成功寫入時，系統 SHALL 以非零狀態碼結束。單篇文章的向量化失敗 SHALL NOT 單獨導致該次執行失敗。
+
+#### Scenario: 向量化配額用盡
+
+- **WHEN** 本次有 3 篇文章進入向量化階段，且全部因取得向量失敗而未寫入
+- **THEN** 該次執行以非零狀態碼結束
+
+#### Scenario: 單篇偶發失敗
+
+- **WHEN** 本次有 2 篇文章進入向量化階段，其中 1 篇失敗、1 篇成功寫入
+- **THEN** 該次執行不因此失敗，失敗的那篇留待下次執行重試
