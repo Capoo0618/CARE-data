@@ -93,7 +93,9 @@ def get_tfc_articles(test_mode=False, start_page=1, max_pages=2): # 注意這裡
                             "title": title,
                             "content": clean_html(raw_content),
                             "source": source_name,
-                            "url": link
+                            "url": link,
+                            "published_at": None,
+                            "updated_at": None,
                         })
                         
                     if test_mode and len(cleaned_articles) >= 3:

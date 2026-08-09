@@ -50,7 +50,11 @@ def get_api_articles(test_mode=False):
                     "title": raw_title.strip(),
                     "content": clean_html(raw_content), # 使用共用工具清洗
                     "source": source["name"],
-                    "url": raw_url
+                    "url": raw_url,
+                    # 兩支 API 都有「發布日期」；只有 HPA 有「修改日期」，
+                    # 食藥署取不到時為 None，代表該來源無法偵測更新。
+                    "published_at": item.get("發布日期") or item.get("PublishDate"),
+                    "updated_at": item.get("修改日期"),
                 })
             
             print(f"  -> 成功清洗 {len(cleaned_articles)} 篇資料")

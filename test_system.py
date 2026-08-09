@@ -211,6 +211,45 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertEqual(written, {"全新文章A", "全新文章B"},
                          "兩篇 url 皆為 None 但標題不同的文章，不得被視為重複")
 
+    def test_08_updated_article_replaces_old_chunks(self):
+        """要求：來源修改日期改變時，舊 chunk 全部清掉重寫"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": "https://example.com/a", "original_title": "文章",
+             "updated_at": "2026-01-01", "chunk_index": 1},
+        ])
+        article = {
+            "title": "文章", "content": "新內容。", "source": "來源",
+            "url": "https://example.com/a",
+            "published_at": "2025-12-01", "updated_at": "2026-08-01",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+
+        self.assertIn({"url": "https://example.com/a"}, collection.deleted_filters,
+                      "修改日期不同時，應先刪除該 url 的既有 chunk")
+        self.assertEqual(len(collection.inserted_batches), 1, "應重新寫入新版本")
+        self.assertEqual(collection.inserted_batches[0][0]["updated_at"], "2026-08-01")
+
+    def test_09_unchanged_article_is_skipped(self):
+        """要求：修改日期相同時維持跳過，不重複嵌入"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": "https://example.com/a", "original_title": "文章",
+             "updated_at": "2026-08-01"},
+        ])
+        article = {
+            "title": "文章", "content": "內容。", "source": "來源",
+            "url": "https://example.com/a", "updated_at": "2026-08-01",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+
+        self.assertEqual(collection.inserted_batches, [], "沒有更新就不該重寫")
+        self.assertEqual(collection.deleted_filters, [], "沒有更新就不該刪除")
+
 if __name__ == '__main__':
     print("==================================================")
     print(" 🏥 ETL 資料管線 - 單元測試與一致性驗證啟動")

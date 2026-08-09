@@ -66,6 +66,17 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
         url = article.get("url")
         title = article["title"]
 
+        # 來源有提供修改日期且與庫中不同 → 視為改版，整篇清掉重寫。
+        # 刻意不用內容雜湊比對：那會讓每次清洗邏輯微調都觸發全量重寫。
+        incoming_updated = article.get("updated_at")
+        if url and incoming_updated:
+            old = collection.find_one({"url": url}, {"updated_at": 1})
+            if old and old.get("updated_at") != incoming_updated:
+                print(f"  🔄 偵測到改版，重寫: {title[:15]}...")
+                collection.delete_many({"url": url})
+                existing_urls.discard(url)
+                existing_titles.discard(title)
+
         if (url and url in existing_urls) or title in existing_titles:
             print(f"  ⏭️ 已存在，跳過: {title[:15]}...")
             continue
@@ -99,6 +110,8 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                 "total_chunks": len(chunks),
                 "embedding": vector,
                 "uploaded_at": time.time(),
+                "published_at": article.get("published_at"),
+                "updated_at": article.get("updated_at"),
             }
             for i, (chunk, vector) in enumerate(zip(chunks, vectors))
         ]
