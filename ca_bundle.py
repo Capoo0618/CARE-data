@@ -13,6 +13,10 @@ macOS 的 curl 會依 leaf 憑證的 AIA 欄位自動補抓，但 Python 的 ssl
 certs/twca_secure_ssl_ca.pem，有效期至 2030-10-16。到期後衛福部會連不上
 並拋出明確的 SSLError——這是刻意的：大聲失敗遠優於 verify=False 那種
 默默什麼都不檢查。屆時重新從 leaf 憑證的 AIA 網址下載新的一張即可。
+
+另一個失效情境：若未來的 certifi 移除了 TWCA Global Root CA，
+單靠這裡釘選的中繼憑證救不回來——Python 預設不設 X509_V_FLAG_PARTIAL_CHAIN，
+憑證鏈必須終止於自簽根憑證。這同樣會讓連線失敗、被 Task 6 的來源檢查抓到。
 """
 
 import atexit
