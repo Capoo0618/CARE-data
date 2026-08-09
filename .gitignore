@@ -1,23 +1,22 @@
-1. 絕對不能上傳的機密檔案 (Security)
-
+# 1. 絕對不能上傳的機密檔案 (Security)
 .env
 
-2. Python 虛擬環境 (Virtual Environments)
-
+# 2. Python 虛擬環境 (Virtual Environments)
 venv/
 env/
 .venv/
 
-3. Python 編譯暫存檔 (Python Cache)
-
-pycache/
+# 3. Python 編譯暫存檔 (Python Cache)
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-4. 開發工具與作業系統產生的垃圾檔
-
+# 4. 開發工具與作業系統產生的垃圾檔
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 5. Git worktrees（隔離工作區，不進版控）
+.worktrees/
