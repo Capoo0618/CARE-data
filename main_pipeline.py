@@ -78,6 +78,10 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
     寫入保證為「全有或全無」：一篇文章的所有 chunk 都成功取得向量才寫入。
     任一 chunk 失敗就整篇跳過、留待下次執行重試——避免產生「宣告 4 塊、
     實際只有 3 塊」這種永遠不會被補上的破洞（線上 pid=16703 即為此類實例）。
+
+    回傳 (new_count, write_failed)：write_failed 為 True 表示至少有一篇文章
+    在寫入階段失敗。單篇失敗不會中止整批（資料面 fail-open），但會透過這個
+    旗標讓 job() 以非零狀態碼結束（訊號面 fail-loud）。
     """
     embed_fn = embed_fn or get_embedding
     print(f"\n=== 🚀 開始將 {len(articles)} 篇文章上傳至 MongoDB ===")
@@ -88,72 +92,104 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
     existing_titles = {t for t in collection.distinct("original_title") if t}
 
     new_count = 0
+    write_failed = False
     for article in articles:
-        url = article.get("url")
-        title = article["title"]
+        deleted_old = False
+        try:
+            url = article.get("url")
+            title = article["title"]
 
-        # 來源有提供修改日期且與庫中不同 → 視為改版。
-        # 刻意不用內容雜湊比對：那會讓每次清洗邏輯微調都觸發全量重寫。
-        # 這裡只做判定，實際刪除延後到 insert_many 之前（見下方），
-        # 確保「刪掉舊版卻寫不出新版」這種資料遺失不會發生。
-        incoming_updated = article.get("updated_at")
-        needs_rewrite = False
-        if url and incoming_updated:
-            old = collection.find_one({"url": url}, {"updated_at": 1})
-            if old and old.get("updated_at") != incoming_updated:
-                print(f"  🔄 偵測到改版，將重寫: {title[:15]}...")
-                needs_rewrite = True
+            # 來源有提供修改日期時，與庫中比對決定是否改版。
+            # 刻意不用內容雜湊比對：那會讓每次清洗邏輯微調都觸發全量重寫。
+            # 這裡只做判定，實際刪除延後到 insert_many 之前（見下方），
+            # 確保「刪掉舊版卻寫不出新版」這種資料遺失不會發生。
+            incoming_updated = article.get("updated_at")
+            needs_rewrite = False
+            if url and incoming_updated:
+                old = collection.find_one({"url": url}, {"updated_at": 1})
+                if old is not None:
+                    old_updated = old.get("updated_at")
+                    if old_updated is None:
+                        # 這一篇是本次變更之前寫入的，沒有日期可比對。
+                        # 只補中繼資料、不重新向量化：把「沒有日期」當成「日期不同」
+                        # 會讓合併後首次執行重算全部既有切片（衛福部約 2,840 個，
+                        # 每個切片有 2 秒節流，實際要跑數小時且極可能耗盡 Gemini 配額），
+                        # 換來的只是內容多半相同的重算。補上日期之後，
+                        # 之後每一次真正的改版都能正常偵測。
+                        # 代價：若某篇在本次變更之前就已於來源改版，那一次改版會被漏掉。
+                        # 這是一次性且有界的，遠低於全量重算的成本。
+                        collection.update_many(
+                            {"url": url},
+                            {"$set": {
+                                "published_at": article.get("published_at"),
+                                "updated_at": incoming_updated,
+                            }},
+                        )
+                        print(f"  📌 補上日期欄位（既有資料，不重算向量）: {title[:15]}...")
+                    elif old_updated != incoming_updated:
+                        print(f"  🔄 偵測到改版，將重寫: {title[:15]}...")
+                        needs_rewrite = True
 
-        if not needs_rewrite and ((url and url in existing_urls) or title in existing_titles):
-            print(f"  ⏭️ 已存在，跳過: {title[:15]}...")
-            continue
+            if not needs_rewrite and ((url and url in existing_urls) or title in existing_titles):
+                print(f"  ⏭️ 已存在，跳過: {title[:15]}...")
+                continue
 
-        chunks = chunk_text(article["content"])
-        if not chunks:
-            print(f"  ⚠️ 內容為空，跳過: {title[:15]}...")
-            continue
+            chunks = chunk_text(article["content"])
+            if not chunks:
+                print(f"  ⚠️ 內容為空，跳過: {title[:15]}...")
+                continue
 
-        print(f"  🆕 [處理中] 向量化並上傳: {title[:15]}...")
-        vectors = []
-        failed = False
-        for i, chunk in enumerate(chunks):
-            vector = embed_fn(f"主題：{title}\n內容：{chunk}")
-            if not vector:
-                print(f"    ⚠️ 第 {i+1}/{len(chunks)} 個切片向量化失敗——"
-                      f"整篇跳過，留待下次執行重試")
-                failed = True
-                break
-            vectors.append(vector)
-        if failed:
-            continue
+            print(f"  🆕 [處理中] 向量化並上傳: {title[:15]}...")
+            vectors = []
+            failed = False
+            for i, chunk in enumerate(chunks):
+                vector = embed_fn(f"主題：{title}\n內容：{chunk}")
+                if not vector:
+                    print(f"    ⚠️ 第 {i+1}/{len(chunks)} 個切片向量化失敗——"
+                          f"整篇跳過，留待下次執行重試")
+                    failed = True
+                    break
+                vectors.append(vector)
+            if failed:
+                continue
 
-        docs = [
-            {
-                "source_name": article["source"],
-                "url": url,
-                "original_title": title,
-                "chunk_content": chunk,
-                "chunk_index": i + 1,
-                "total_chunks": len(chunks),
-                "embedding": vector,
-                "uploaded_at": time.time(),
-                "published_at": article.get("published_at"),
-                "updated_at": article.get("updated_at"),
-            }
-            for i, (chunk, vector) in enumerate(zip(chunks, vectors))
-        ]
-        if needs_rewrite:
-            collection.delete_many({"url": url})
-        collection.insert_many(docs)
-        print(f"    ✅ 成功寫入 {len(docs)} 個切片")
+            docs = [
+                {
+                    "source_name": article["source"],
+                    "url": url,
+                    "original_title": title,
+                    "chunk_content": chunk,
+                    "chunk_index": i + 1,
+                    "total_chunks": len(chunks),
+                    "embedding": vector,
+                    "uploaded_at": time.time(),
+                    "published_at": article.get("published_at"),
+                    "updated_at": article.get("updated_at"),
+                }
+                for i, (chunk, vector) in enumerate(zip(chunks, vectors))
+            ]
+            if needs_rewrite:
+                collection.delete_many({"url": url})
+                deleted_old = True
+            collection.insert_many(docs)
+            print(f"    ✅ 成功寫入 {len(docs)} 個切片")
 
-        # 讓同一批次內的重複文章也能被擋掉
-        if url:
-            existing_urls.add(url)
-        existing_titles.add(title)
-        new_count += 1
+            # 讓同一批次內的重複文章也能被擋掉
+            if url:
+                existing_urls.add(url)
+            existing_titles.add(title)
+            new_count += 1
+        except Exception as e:
+            # 單篇失敗不連累整批：資料面能寫多少寫多少。
+            # 但一定要回報，讓 job() 以非零狀態碼結束——訊號面 fail-loud。
+            write_failed = True
+            ident = article.get("url") or article.get("title") or "（無法辨識）"
+            print(f"  ❌ 這篇處理失敗，其餘文章照常繼續：{ident} —— {e}")
+            if deleted_old:
+                print("     ⚠️ 舊版切片已刪除但新版尚未寫入。此 URL 已不在庫中，"
+                      "下次執行會當成全新文章重新寫入，暴露時間最長一個排程週期。")
 
-    return new_count
+    return new_count, write_failed
 
 def job():
     """執行一次完整 ETL。回傳 0 表示正常，1 表示有來源全滅或寫入失敗。"""
@@ -178,8 +214,13 @@ def job():
     try:
         client = MongoClient(MONGO_URI)
         collection = client["CARE_database"]["health_articles_chunks"]
-        total_new = upload_to_mongodb(all_articles, collection)
-        print(f"\n=== 🔴 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 任務結束！成功上傳了 {total_new} 篇全新文章 ===")
+        total_new, write_failed = upload_to_mongodb(all_articles, collection)
+        print(f"\n=== 🔴 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 任務結束！"
+              f"成功寫入 {total_new} 篇文章（新增與改版合計） ===")
+        if write_failed:
+            print("❌ 嚴重：有文章在寫入階段失敗（詳見上方訊息）。")
+            print("   本次執行將以非零狀態碼結束。")
+            exit_code = 1
     except Exception as e:
         print(f"❌ 嚴重：MongoDB 連線或上傳失敗: {e}")
         print("   本次執行將以非零狀態碼結束。")

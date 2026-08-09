@@ -14,6 +14,7 @@ class FakeCollection:
         self.docs = list(existing or [])
         self.inserted_batches = []
         self.deleted_filters = []
+        self.update_many_calls = []
 
     def distinct(self, field):
         return [d.get(field) for d in self.docs if d.get(field) is not None]
@@ -32,6 +33,17 @@ class FakeCollection:
         self.deleted_filters.append(query)
         url = query.get("url")
         self.docs = [d for d in self.docs if d.get("url") != url]
+
+    def update_many(self, filt, update):
+        """只支援 {"url": ...} 條件與 $set —— 與 main_pipeline 實際用法一致。"""
+        url = filt.get("url")
+        changed = 0
+        for doc in self.docs:
+            if doc.get("url") == url:
+                doc.update(update["$set"])
+                changed += 1
+        self.update_many_calls.append((filt, update))
+        return changed
 
 
 def fake_embed_ok(text):
@@ -272,13 +284,16 @@ class TestHealthETLPipeline(unittest.TestCase):
 
     def test_11_ca_bundle_contains_pinned_intermediate(self):
         """要求：CA bundle 同時含 certifi 根憑證與釘選的 TWCA 中繼憑證"""
+        import os
+
         import certifi
-        from ca_bundle import get_ca_bundle
+        from ca_bundle import _PINNED_DIR, get_ca_bundle
 
         bundle_path = get_ca_bundle()
         bundle = open(bundle_path, encoding="utf-8").read()
         certifi_content = open(certifi.where(), encoding="utf-8").read()
-        pinned = open("certs/twca_secure_ssl_ca.pem", encoding="utf-8").read()
+        pinned = open(os.path.join(_PINNED_DIR, "twca_secure_ssl_ca.pem"),
+                     encoding="utf-8").read()
 
         self.assertIn(pinned.strip(), bundle, "bundle 必須包含釘選的 TWCA 中繼憑證")
         self.assertIn(certifi_content[:200], bundle, "bundle 必須保留 certifi 的根憑證清單")
@@ -303,6 +318,121 @@ class TestHealthETLPipeline(unittest.TestCase):
         # 數量不影響判定——只要有產出就算通過
         one_each = [{"source": s} for s in EXPECTED_SOURCES]
         self.assertEqual(find_missing_sources(one_each), set())
+
+    def test_13_legacy_article_without_updated_at_is_backfilled_not_reembedded(self):
+        """既有資料沒有 updated_at 時，只補日期欄位，不刪除也不重新向量化。
+
+        線上既有文件是本次變更之前寫入的，一律沒有 updated_at。若把「沒有」
+        當成「不同」，合併後首次執行會重算全部 2,840 個切片（約數小時、
+        極可能耗盡配額），而換得的只是內容多半相同的重算。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/a", "original_title": "舊文",
+             "chunk_content": "舊內容", "chunk_index": 1, "total_chunks": 1,
+             "embedding": [0.1]},
+        ])
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/a",
+            "title": "舊文", "content": "新內容",
+            "published_at": "2024/01/01", "updated_at": "2024/03/15",
+        }
+
+        calls = []
+
+        def counting_embed(text):
+            calls.append(text)
+            return [0.5] * 3072
+
+        upload_to_mongodb([article], collection, embed_fn=counting_embed)
+
+        self.assertEqual(calls, [], "既有資料只需補日期，不應重新呼叫向量化 API")
+        self.assertEqual(collection.deleted_filters, [], "不應刪除任何既有切片")
+        self.assertEqual(len(collection.docs), 1, "切片數不應改變")
+        self.assertEqual(collection.docs[0]["updated_at"], "2024/03/15",
+                         "應補上 updated_at，否則之後真正的改版永遠偵測不到")
+        self.assertEqual(collection.docs[0]["published_at"], "2024/01/01")
+        self.assertEqual(collection.docs[0]["chunk_content"], "舊內容",
+                         "內容不應被更動——本次只補中繼資料")
+
+    def test_14_write_failure_skips_one_article_and_continues(self):
+        """單篇寫入失敗只跳過該篇，其餘照常處理，並回報 write_failed=True。
+
+        設計原則：資料面 fail-open（能寫多少寫多少）、訊號面 fail-loud
+        （回傳值讓 job() 以非零狀態碼結束）。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([])
+        original_insert = collection.insert_many
+
+        def failing_first_insert(docs):
+            if docs[0]["url"] == "https://example.tw/bad":
+                raise RuntimeError("模擬 Atlas 寫入失敗")
+            return original_insert(docs)
+
+        collection.insert_many = failing_first_insert
+
+        articles = [
+            {"source": "衛福部闢謠網站", "url": "https://example.tw/bad",
+             "title": "會失敗的文章", "content": "內容", "updated_at": None},
+            {"source": "衛福部闢謠網站", "url": "https://example.tw/ok",
+             "title": "後面的文章", "content": "內容", "updated_at": None},
+        ]
+
+        new_count, write_failed = upload_to_mongodb(
+            articles, collection, embed_fn=fake_embed_ok)
+
+        self.assertTrue(write_failed, "寫入失敗必須回報，否則 CI 不會紅燈")
+        self.assertEqual(new_count, 1, "後面的文章不應被前一篇的例外連累")
+        titles = {d["original_title"] for d in collection.docs}
+        self.assertEqual(titles, {"後面的文章"})
+
+    def test_15_duplicate_article_in_same_batch_written_once(self):
+        """同一批次內出現兩次的文章只寫入一次。
+
+        來源翻頁重疊或改版偵測都可能讓同一篇出現兩次；若沒有批次內去重，
+        知識庫會出現重複切片，直接汙染下游 RAG 的檢索結果。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([])
+        article = {
+            "source": "台灣事實查核中心", "url": "https://example.tw/dup",
+            "title": "重複的文章", "content": "內容", "updated_at": None,
+        }
+
+        new_count, write_failed = upload_to_mongodb(
+            [article, dict(article)], collection, embed_fn=fake_embed_ok)
+
+        self.assertFalse(write_failed)
+        self.assertEqual(new_count, 1)
+        self.assertEqual(len(collection.docs), 1, "同一篇不應寫入兩次")
+
+    def test_16_rewrite_with_empty_content_does_not_delete_old_version(self):
+        """改版文章若新內容為空，必須保留舊版，不得刪除。
+
+        這是資料遺失路徑上的守衛：空內容 → chunk_text 回傳 []，
+        若刪除發生在此之前，該篇就會被清空且下次也補不回來。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/e", "original_title": "有舊版的文章",
+             "chunk_content": "舊內容", "chunk_index": 1, "total_chunks": 1,
+             "embedding": [0.1], "updated_at": "2024/01/01"},
+        ])
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/e",
+            "title": "有舊版的文章", "content": "", "updated_at": "2024/09/09",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+
+        self.assertEqual(collection.deleted_filters, [], "不應刪除舊版")
+        self.assertEqual(len(collection.docs), 1)
+        self.assertEqual(collection.docs[0]["chunk_content"], "舊內容")
 
 if __name__ == '__main__':
     print("==================================================")
