@@ -66,18 +66,19 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
         url = article.get("url")
         title = article["title"]
 
-        # 來源有提供修改日期且與庫中不同 → 視為改版，整篇清掉重寫。
+        # 來源有提供修改日期且與庫中不同 → 視為改版。
         # 刻意不用內容雜湊比對：那會讓每次清洗邏輯微調都觸發全量重寫。
+        # 這裡只做判定，實際刪除延後到 insert_many 之前（見下方），
+        # 確保「刪掉舊版卻寫不出新版」這種資料遺失不會發生。
         incoming_updated = article.get("updated_at")
+        needs_rewrite = False
         if url and incoming_updated:
             old = collection.find_one({"url": url}, {"updated_at": 1})
             if old and old.get("updated_at") != incoming_updated:
-                print(f"  🔄 偵測到改版，重寫: {title[:15]}...")
-                collection.delete_many({"url": url})
-                existing_urls.discard(url)
-                existing_titles.discard(title)
+                print(f"  🔄 偵測到改版，將重寫: {title[:15]}...")
+                needs_rewrite = True
 
-        if (url and url in existing_urls) or title in existing_titles:
+        if not needs_rewrite and ((url and url in existing_urls) or title in existing_titles):
             print(f"  ⏭️ 已存在，跳過: {title[:15]}...")
             continue
 
@@ -115,6 +116,8 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
             }
             for i, (chunk, vector) in enumerate(zip(chunks, vectors))
         ]
+        if needs_rewrite:
+            collection.delete_many({"url": url})
         collection.insert_many(docs)
         print(f"    ✅ 成功寫入 {len(docs)} 個切片")
 

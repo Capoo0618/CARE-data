@@ -250,6 +250,29 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertEqual(collection.inserted_batches, [], "沒有更新就不該重寫")
         self.assertEqual(collection.deleted_filters, [], "沒有更新就不該刪除")
 
+    def test_10_failed_rewrite_does_not_delete_old_version(self):
+        """要求：改版重寫時若向量化失敗，不得刪除舊版本（避免資料遺失）"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": "https://example.com/a", "original_title": "文章",
+             "updated_at": "2026-01-01", "chunk_index": 1},
+        ])
+        article = {
+            "title": "文章", "content": "第一句。" * 200, "source": "來源",
+            "url": "https://example.com/a",
+            "published_at": "2025-12-01", "updated_at": "2026-08-01",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=make_failing_embed(2))
+
+        self.assertEqual(collection.deleted_filters, [],
+                         "向量化失敗時不得刪除舊版本")
+        self.assertEqual(collection.inserted_batches, [], "也不應寫入新版本")
+        self.assertTrue(any(d.get("url") == "https://example.com/a"
+                            for d in collection.docs),
+                        "舊版本必須原封不動留在庫中")
+
 if __name__ == '__main__':
     print("==================================================")
     print(" 🏥 ETL 資料管線 - 單元測試與一致性驗證啟動")
