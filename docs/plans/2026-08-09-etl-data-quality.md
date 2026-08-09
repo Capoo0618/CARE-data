@@ -464,6 +464,29 @@ git commit -m "fix(etl): 寫入改為全有或全無，去重判定由來源降�
         self.assertEqual(collection.deleted_filters, [], "沒有更新就不該刪除")
 ```
 
+    def test_10_failed_rewrite_does_not_delete_old_version(self):
+        """要求：改版重寫時若向量化失敗，不得刪除舊版本（避免資料遺失）"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": "https://example.com/a", "original_title": "文章",
+             "updated_at": "2026-01-01", "chunk_index": 1},
+        ])
+        article = {
+            "title": "文章", "content": "第一句。" * 200, "source": "來源",
+            "url": "https://example.com/a",
+            "published_at": "2025-12-01", "updated_at": "2026-08-01",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=make_failing_embed(2))
+
+        self.assertEqual(collection.deleted_filters, [],
+                         "向量化失敗時不得刪除舊版本")
+        self.assertEqual(collection.inserted_batches, [], "也不應寫入新版本")
+        self.assertTrue(any(d.get("url") == "https://example.com/a"
+                            for d in collection.docs),
+                        "舊版本必須原封不動留在庫中")
+
 - [ ] **Step 2: 執行測試確認失敗**
 
 Run: `python test_system.py TestHealthETLPipeline.test_08_updated_article_replaces_old_chunks -v`
@@ -491,20 +514,46 @@ Expected: FAIL — 舊 chunk 未被刪除（`deleted_filters` 為空）
 
 - [ ] **Step 4: `upload_to_mongodb` 加入更新判定**
 
-在 Task 2 版本的「已存在則跳過」那段之前插入：
+**刪除必須延後到「確定寫得出新版本」之後** —— 否則若刪完之後某個 chunk 向量化失敗，
+舊 chunk 已消失、新的寫不進去，線上該篇文章直接不見。這會違反本 change 自己的 spec
+（`specs/etl-ingestion/spec.md` 的「寫入完整性」requirement）。
+
+在 Task 2 版本的「已存在則跳過」那段之前，插入**判定**（不刪除）：
 
 ```python
-        # 來源有提供修改日期且與庫中不同 → 視為改版，整篇清掉重寫。
+        # 來源有提供修改日期且與庫中不同 → 視為改版。
         # 刻意不用內容雜湊比對：那會讓每次清洗邏輯微調都觸發全量重寫。
+        # 這裡只做判定，實際刪除延後到 insert_many 之前（見下方），
+        # 確保「刪掉舊版卻寫不出新版」這種資料遺失不會發生。
         incoming_updated = article.get("updated_at")
+        needs_rewrite = False
         if url and incoming_updated:
             old = collection.find_one({"url": url}, {"updated_at": 1})
             if old and old.get("updated_at") != incoming_updated:
-                print(f"  🔄 偵測到改版，重寫: {title[:15]}...")
-                collection.delete_many({"url": url})
-                existing_urls.discard(url)
-                existing_titles.discard(title)
+                print(f"  🔄 偵測到改版，將重寫: {title[:15]}...")
+                needs_rewrite = True
 ```
+
+接著把原本的「已存在則跳過」條件改成讓改版文章通過：
+
+```python
+        if not needs_rewrite and ((url and url in existing_urls) or title in existing_titles):
+            print(f"  ⏭️ 已存在，跳過: {title[:15]}...")
+            continue
+```
+
+最後在 `collection.insert_many(docs)` **之前**才真正刪除舊版：
+
+```python
+        if needs_rewrite:
+            collection.delete_many({"url": url})
+        collection.insert_many(docs)
+```
+
+這樣所有的提早離開路徑（`if not chunks: continue`、`if failed: continue`）
+都發生在刪除之前，舊資料不會在沒有替代品的情況下消失。
+也因為不再需要 `discard`，順帶消除了「改版同時改標題時，舊標題殘留在
+`existing_titles`」這個邊角問題。
 
 並在 `docs` 的每個 dict 裡補兩個欄位：
 
