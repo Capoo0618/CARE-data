@@ -32,7 +32,7 @@
 
 ## 5. Definition of Done
 
-- [x] 5.1 `python test_system.py` 全綠，共 24 個測試（含 `test_02`／`test_03` 的線上一致性驗證，執行時需要網路連線）
+- [x] 5.1 `python test_system.py` 全綠，共 33 個測試（含 `test_02`／`test_03` 的線上一致性驗證，執行時需要網路連線）
 - [x] 5.2 有清楚的 git commit；本 change 對下游 CARE Backend 影響極小且不需 cutover——
   不改變 `chunk_content` 內容或 embedding 產生方式，既有向量完全有效；既有文件會新增
   `published_at` / `updated_at` 兩個欄位，並一次性重寫 71 篇既有的不完整文章（詳見 proposal.md）
@@ -73,3 +73,16 @@
   `test_22_systematic_embedding_failure_is_reported`、
   `test_23_single_embedding_failure_does_not_fail_the_run`、
   `test_24_empty_title_article_is_written_at_most_once`
+
+## 9. 突變測試與補上的覆蓋
+
+- [x] 9.1 對整套測試做突變測試，逐一注入缺陷確認測試會紅（見 design.md 的 D10）
+- [x] 9.2 `main_pipeline.py`：`job()` 新增 `fetchers` / `collection_factory` /
+  `embed_fn` 三個依賴注入點，讓退出碼的判定能在無網路下驗證
+- [x] 9.3 `main_pipeline.py`：`__main__` 的環境偵測抽成 `main(env, job_fn)`，
+  把不可測的 wiring 縮到 `sys.exit(main())` 一行
+- [x] 9.4 測試：新增 `test_25`（寫入文件的每個欄位）、`test_26`／`test_27`
+  （批次內以 url／標題去重）、`test_28`（DB 端 url 集合真的有載入）、
+  `test_29` 至 `test_32`（`job()` 的四種退出碼情境）、
+  `test_33`（CI 模式把退出碼傳回作業系統）
+- [x] 9.5 `test_11` 改為解碼 PEM 後比對 SHA-256 指紋，擋得住位元層級的竄改

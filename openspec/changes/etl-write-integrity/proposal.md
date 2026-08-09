@@ -35,7 +35,7 @@
   `certs/twca_secure_ssl_ca.pem`
 - **刪除**：`test_pipeline.py`（過時副本，見 `tasks.md` 第 4 節）
 - **測試**：`test_system.py` 新增寫入邏輯的單元測試（對外部呼叫以依賴注入傳入假件，不打真實網路），
-  共 24 個測試
+  共 33 個測試
 - **相依**：新增 `certifi>=2024.2.2`（提供根憑證庫給 D4 的 CA bundle）。
   刻意不釘死版本——釘死等於凍結根憑證庫，對安全性反而更糟
 - **對下游 CARE Backend 的影響：極小且不需 cutover**

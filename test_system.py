@@ -316,6 +316,18 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertGreater(len(bundle), len(certifi_content),
                            "bundle 應為 certifi 的超集，而非取代它")
 
+        # 上面的比對只證明「檔案裡有什麼就併進去了」，不會發現檔案本身被換掉或
+        # 損毀。這裡把 PEM 解碼成 DER 後比對 SHA-256，才擋得住位元層級的竄改。
+        import hashlib
+        import ssl
+
+        der = ssl.PEM_cert_to_DER_cert(pinned)
+        self.assertEqual(
+            hashlib.sha256(der).hexdigest().upper(),
+            "1A2C75FD096E0499E9FF6AC74E526F61EAAE3EDFC8C2EA4436FEE0C24D8B7D0E",
+            "釘選的憑證與 certs/README.md 記錄的 SHA-256 不符——"
+            "檔案可能被替換或損毀")
+
     def test_12_find_missing_sources(self):
         """要求：能偵測出「某個來源本次一篇都沒抓到」"""
         from main_pipeline import EXPECTED_SOURCES, find_missing_sources
@@ -680,6 +692,212 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         self.assertEqual(len(collection.docs), first_run,
                          "第二次執行不應再寫入一次")
+
+    # ------------------------------------------------------------------
+    # 寫入文件的內容
+    # ------------------------------------------------------------------
+
+    def test_25_written_document_has_correct_shape(self):
+        """寫入的每一個欄位都要對。
+
+        在此之前沒有任何測試斷言過文件的「內容」——只斷言了筆數與是否寫入。
+        突變測試證實：把 chunk_content 換成標題、embedding 換成空 list、
+        source_name 換成 None、chunk_index 改為 0 起算，整套測試都照樣全綠。
+        這些欄位全部是下游 CARE Backend 直接讀取的。
+        """
+        from main_pipeline import chunk_text, upload_to_mongodb
+
+        collection = FakeCollection([])
+        content = "衛教內容" * 200          # 800 字，確定會切成多塊
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/shape",
+            "title": "欄位形狀測試", "content": content,
+            "published_at": "2024/01/01", "updated_at": "2024/03/15",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+
+        expected_chunks = chunk_text(content)
+        self.assertGreater(len(expected_chunks), 1, "測資本身要能切出多塊才有意義")
+        self.assertEqual(len(collection.docs), len(expected_chunks))
+
+        for i, (doc, expected_chunk) in enumerate(
+                zip(collection.docs, expected_chunks)):
+            self.assertEqual(doc["source_name"], "衛福部闢謠網站")
+            self.assertEqual(doc["url"], "https://example.tw/shape")
+            self.assertEqual(doc["original_title"], "欄位形狀測試")
+            self.assertEqual(doc["chunk_content"], expected_chunk,
+                             "chunk_content 必須是切片本身，不是標題或其他東西")
+            self.assertEqual(doc["chunk_index"], i + 1,
+                             "chunk_index 由 1 起算")
+            self.assertEqual(doc["total_chunks"], len(expected_chunks))
+            self.assertEqual(doc["embedding"], fake_embed_ok(""),
+                             "embedding 必須是向量化的結果")
+            self.assertEqual(doc["published_at"], "2024/01/01")
+            self.assertEqual(doc["updated_at"], "2024/03/15")
+            self.assertIsInstance(doc["uploaded_at"], float)
+
+    # ------------------------------------------------------------------
+    # 同一批次內的去重
+    # ------------------------------------------------------------------
+
+    def test_26_same_url_different_titles_in_one_batch(self):
+        """同一批次內 url 相同、標題不同的兩篇只寫入一次。
+
+        來源改標題或翻頁重疊都會產生這種情形。標題不同，所以標題去重救不了，
+        必須靠批次內的 url 記錄。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([])
+        base = {"source": "衛福部闢謠網站", "url": "https://example.tw/same",
+                "content": "內容", "updated_at": None}
+        articles = [dict(base, title="標題甲"), dict(base, title="標題乙")]
+
+        new_count, _ = upload_to_mongodb(
+            articles, collection, embed_fn=fake_embed_ok)
+
+        self.assertEqual(new_count, 1, "同一個 url 在一個批次內只能寫入一次")
+        self.assertEqual(len(collection.docs), 1)
+
+    def test_27_url_none_same_title_in_one_batch(self):
+        """同一批次內 url 皆為 None、標題相同的兩篇只寫入一次。
+
+        食藥署 706 篇文章的 url 全為 None，標題是唯一的去重鍵；
+        少了批次內的標題記錄，同一批次的重複會直接變成重複切片。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([])
+        base = {"source": "食藥署闢謠專區", "url": None,
+                "title": "同一篇文章", "content": "內容", "updated_at": None}
+
+        new_count, _ = upload_to_mongodb(
+            [dict(base), dict(base)], collection, embed_fn=fake_embed_ok)
+
+        self.assertEqual(new_count, 1, "url 為 None 時標題就是去重鍵")
+        self.assertEqual(len(collection.docs), 1)
+
+    def test_28_existing_url_with_changed_title_is_skipped(self):
+        """庫中已有這個 url 時就跳過，即使來源這次給的標題不同。
+
+        驗證的是「url 集合真的有從資料庫載入」——標題不同，
+        所以標題去重不會誤打誤撞地讓這個測試通過。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/renamed", "original_title": "舊標題",
+             "chunk_content": "舊內容", "chunk_index": 1, "total_chunks": 1,
+             "embedding": [0.1]},
+        ])
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/renamed",
+            "title": "改過的新標題", "content": "內容", "updated_at": None,
+        }
+
+        new_count, _ = upload_to_mongodb(
+            [article], collection, embed_fn=fake_embed_ok)
+
+        self.assertEqual(new_count, 0, "url 已存在就該跳過")
+        self.assertEqual(len(collection.docs), 1)
+
+    # ------------------------------------------------------------------
+    # job() 的退出碼
+    # ------------------------------------------------------------------
+
+    def _three_source_articles(self):
+        return [
+            {"source": "食藥署闢謠專區", "url": None, "title": "食藥署文章",
+             "content": "內容", "updated_at": None},
+            {"source": "衛福部闢謠網站", "url": "https://example.tw/hpa",
+             "title": "衛福部文章", "content": "內容", "updated_at": None},
+            {"source": "台灣事實查核中心", "url": "https://example.tw/tfc",
+             "title": "查核中心文章", "content": "內容", "updated_at": None},
+        ]
+
+    def test_29_job_returns_zero_when_everything_succeeds(self):
+        """三個來源都有產出且寫入成功時，退出碼為 0。
+
+        這是防止「修過頭」的守衛：若有人讓 job() 永遠回傳 1，CI 會天天紅燈，
+        維護者很快就會忽略它。
+        """
+        from main_pipeline import job
+
+        collection = FakeCollection([])
+        articles = self._three_source_articles()
+
+        rc = job(fetchers=(lambda: articles,),
+                 collection_factory=lambda: collection,
+                 embed_fn=fake_embed_ok)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(collection.docs), 3)
+
+    def test_30_job_returns_one_on_missing_source_but_still_writes_others(self):
+        """來源全滅時退出碼為 1，但其餘來源的文章仍照常寫入。
+
+        兩件事要同時成立：資料面 fail-open（不因一個來源失效就整批中止）、
+        訊號面 fail-loud（CI 必須紅燈）。少了任何一半都是回歸。
+        """
+        from main_pipeline import job
+
+        collection = FakeCollection([])
+        articles = [a for a in self._three_source_articles()
+                    if a["source"] != "台灣事實查核中心"]
+
+        rc = job(fetchers=(lambda: articles,),
+                 collection_factory=lambda: collection,
+                 embed_fn=fake_embed_ok)
+
+        self.assertEqual(rc, 1, "有來源一篇都沒抓到必須讓 CI 紅燈")
+        self.assertEqual(len(collection.docs), 2,
+                         "其餘來源的文章仍須照常寫入——不得提早 return")
+
+    def test_31_job_returns_one_when_collection_is_unreachable(self):
+        """連不上 MongoDB 時退出碼為 1。"""
+        from main_pipeline import job
+
+        def unreachable():
+            raise RuntimeError("模擬 Atlas 連線失敗")
+
+        rc = job(fetchers=(lambda: self._three_source_articles(),),
+                 collection_factory=unreachable,
+                 embed_fn=fake_embed_ok)
+
+        self.assertEqual(rc, 1)
+
+    def test_32_job_returns_one_when_a_write_fails(self):
+        """upload_to_mongodb 回報寫入失敗時，job() 必須據以回傳 1。"""
+        from main_pipeline import job
+
+        class FailingInsert(FakeCollection):
+            def insert_many(self, docs):
+                raise RuntimeError("模擬 Atlas 寫入失敗")
+
+        collection = FailingInsert([])
+
+        rc = job(fetchers=(lambda: self._three_source_articles(),),
+                 collection_factory=lambda: collection,
+                 embed_fn=fake_embed_ok)
+
+        self.assertEqual(rc, 1, "job() 不得忽略 upload_to_mongodb 回報的失敗")
+
+    def test_33_ci_mode_propagates_the_exit_code(self):
+        """GITHUB_ACTIONS 模式必須把 job() 的退出碼交回給作業系統。
+
+        整條「失敗必須可見」的鏈條，最後一環就是這裡：job() 算出 1，
+        但如果沒有一路傳到 sys.exit()，Actions 依然是綠燈。
+        常駐模式的無限迴圈無法在測試中執行，所以只測 CI 這一支。
+        """
+        from main_pipeline import main
+
+        self.assertEqual(
+            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 1), 1,
+            "job() 回傳 1 時 CI 模式必須也回傳 1")
+        self.assertEqual(
+            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 0), 0,
+            "成功時不得誤報失敗")
 
 
 if __name__ == '__main__':
