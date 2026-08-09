@@ -28,3 +28,9 @@
 
 - [ ] 5.1 `python test_system.py` 全綠（含 `test_02`／`test_03` 的線上一致性驗證，執行時需要網路連線）
 - [ ] 5.2 有清楚的 git commit；本 change 對下游 CARE Backend 無影響（不改變既有欄位內容或向量，不需重建、不需 cutover）
+
+## 6. 來源全滅與寫入失敗必須讓 CI 紅燈
+
+- [ ] 6.1 `main_pipeline.py`：新增 `EXPECTED_SOURCES`（三個來源的正式名稱）與純函式 `find_missing_sources(articles, expected=EXPECTED_SOURCES)`，回傳本次完全沒有產出任何文章的來源名稱集合；刻意只看「有沒有產出」而不看數量，避免文章數自然波動造成假警報
+- [ ] 6.2 `main_pipeline.py`：`job()` 簽名改變為回傳 0（成功）或 1（有來源全滅或 MongoDB 連線／寫入失敗）；`__main__` 區塊在 `GITHUB_ACTIONS=true` 的單次執行模式下 `sys.exit(job())`，讓非零退出碼使 CI 紅燈；常駐排程模式刻意不因單次失敗而終止程序
+- [ ] 6.3 測試（純函式測試，不得發出網路請求）：`test_system.py` 新增 `test_12_find_missing_sources`，涵蓋三個來源都有產出、單一來源全滅、完全沒有任何文章三種情境；既有 `test_02`／`test_03` 之線上一致性測試維持不變
