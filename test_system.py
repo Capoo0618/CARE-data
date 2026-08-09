@@ -20,9 +20,18 @@ class FakeCollection:
         return [d.get(field) for d in self.docs if d.get(field) is not None]
 
     def find_one(self, query, projection=None):
+        """套用 projection（僅支援 {"欄位": 1, ...} 這種 inclusion 形式），
+        與 pymongo 慣例一致：未給 projection 時回傳完整文件，
+        給了則只回傳被指名的欄位（`_id` 若存在則一併保留）。
+        """
         for d in self.docs:
             if all(d.get(k) == v for k, v in query.items()):
-                return d
+                if projection is None:
+                    return d
+                result = {k: d[k] for k in projection if k != "_id" and k in d}
+                if "_id" in d:
+                    result["_id"] = d["_id"]
+                return result
         return None
 
     def insert_many(self, docs):
@@ -511,6 +520,34 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertEqual(len(collection.docs), 2)
         self.assertTrue(all(d["updated_at"] == "2024/03/15" for d in collection.docs),
                         "所有切片都要補上日期")
+
+    def test_19_repair_with_embedding_failure_does_not_delete_old_version(self):
+        """破洞修復重寫時若向量化失敗，不得刪除舊版本（避免資料遺失）。
+
+        needs_rewrite 不論由哪個分支設定——test_10 驗證的是「改版偵測」
+        觸發的路徑，這裡驗證的是「破洞判斷」觸發的路徑——下游都必須走
+        同一套「先向量化成功、才刪除舊版」保證。寫成測試而不是只靠推論。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": "https://example.com/hole-fail", "original_title": "破洞文章",
+             "chunk_index": 1, "total_chunks": 3},
+        ])
+        article = {
+            "title": "破洞文章", "content": "第一句。" * 200, "source": "衛福部闢謠網站",
+            "url": "https://example.com/hole-fail",
+            "published_at": "2025-12-01", "updated_at": "2026-08-01",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=make_failing_embed(2))
+
+        self.assertEqual(collection.deleted_filters, [],
+                         "向量化失敗時不得刪除舊版本")
+        self.assertEqual(collection.inserted_batches, [], "也不應寫入新版本")
+        self.assertTrue(any(d.get("url") == "https://example.com/hole-fail"
+                            for d in collection.docs),
+                        "舊版本必須原封不動留在庫中")
 
 if __name__ == '__main__':
     print("==================================================")
