@@ -1,11 +1,8 @@
 # scraper_api.py
 import time
 import requests
-import urllib3
+from ca_bundle import get_ca_bundle
 from utils import clean_html
-
-# 關閉憑證警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_api_articles(test_mode=False):
     """
@@ -29,7 +26,7 @@ def get_api_articles(test_mode=False):
         print(f"\n[{source['name']}] 開始抓取 API: {source['url']}")
         try:
             time.sleep(1) 
-            response = requests.get(source['url'], headers=headers, timeout=15, verify=False)
+            response = requests.get(source['url'], headers=headers, timeout=15, verify=get_ca_bundle())
             response.raise_for_status()
             raw_data = response.json()
             
@@ -44,13 +41,20 @@ def get_api_articles(test_mode=False):
                 raw_url = item.get("\u9023\u7d50\u7db2\u5740", item.get("url", item.get("Url", item.get("URL", item.get("連結", None)))))
                 if raw_url == "": raw_url = None
 
-                if not raw_title and not raw_content: continue
+                # 標題或內容任一為空就跳過（原本是 and，兩者都空才跳過）。
+                # 沒有標題的文章去重只能靠空字串當鍵，而且向量化的輸入會變成
+                # 「主題：（空）內容：…」，檢索品質明顯較差——不如不收。
+                if not raw_title or not raw_content: continue
 
                 cleaned_articles.append({
                     "title": raw_title.strip(),
                     "content": clean_html(raw_content), # 使用共用工具清洗
                     "source": source["name"],
-                    "url": raw_url
+                    "url": raw_url,
+                    # 兩支 API 都有「發布日期」；只有 HPA 有「修改日期」，
+                    # 食藥署取不到時為 None，代表該來源無法偵測更新。
+                    "published_at": item.get("發布日期") or item.get("PublishDate"),
+                    "updated_at": item.get("修改日期"),
                 })
             
             print(f"  -> 成功清洗 {len(cleaned_articles)} 篇資料")
