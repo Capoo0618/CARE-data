@@ -33,14 +33,15 @@
   Task 3  存日期並依修改日期更新                          (#8)
   Task 4  移除 verify=False                               (次要項)
   Task 5  刪除過時副本 test_pipeline.py
+  Task 6  來源全滅／寫入失敗要讓 CI 紅燈        (Task 4 撞出的新問題)
 
 批次 2（etl-content-quality）—— 會使既有向量失效，需全量重建
-  Task 6  openspec change 骨架
-  Task 7  clean_html 改 BS4 並保留段落                    (#3, #4)
-  Task 8  chunk_text 改句界切分                           (#5)
-  Task 9  標題落地 chunk_content + taskType               (#2, #1)
-  Task 10 改用批次 embedding 端點
-  Task 11 遷移腳本：v2 collection + 雙來源回填
+  Task 7  openspec change 骨架
+  Task 8  clean_html 改 BS4 並保留段落                    (#3, #4)
+  Task 9  chunk_text 改句界切分                           (#5)
+  Task 10 標題落地 chunk_content + taskType               (#2, #1)
+  Task 11 改用批次 embedding 端點
+  Task 12 遷移腳本：v2 collection + 雙來源回填
 ```
 
 **非範圍**：食藥署 URL（#6）已決定採 B 案（接受無 URL，下游已支援「來源名｜標題」顯示），不做。
@@ -777,7 +778,191 @@ git commit -m "chore: 刪除過時副本 test_pipeline.py
 
 ---
 
-### Task 6: openspec change `etl-content-quality` 骨架
+### Task 6: 來源全滅與寫入失敗必須讓 CI 紅燈
+
+**Files:**
+- Modify: `main_pipeline.py`（`job()` 與 `__main__` 區塊）
+- Test: `test_system.py` 新增 `test_12_find_missing_sources`
+
+**Interfaces:**
+- Consumes: 無
+- Produces:
+  - `EXPECTED_SOURCES: frozenset[str]`
+  - `find_missing_sources(articles, expected=EXPECTED_SOURCES) -> set[str]`（純函式）
+  - `job() -> int`（**簽名改變**：回傳 0 表示成功、1 表示有來源全滅或寫入失敗）
+
+**為什麼加這個 task（原計畫沒有，是 Task 4 撞出來的）**
+
+Task 4 實作時發現：移除 `verify=False` 後衛福部因憑證問題連不上，但
+
+- `scraper_api.py` 的 `except Exception as e: print(...)` 把整個來源的失敗吞掉，函式照常回傳（只剩其他來源的資料）
+- `test_02_api_data_integrity` 只斷言**食藥署**的標題，衛福部掛掉它不會失敗
+- `job()` 的 MongoDB 區塊同樣是 `except Exception: print(...)`，寫入完全失敗也不影響退出碼
+
+結果：**衛福部（佔知識庫 65%，2,840 / 4,339 chunks）可以完全停止更新，而測試 11/11 全綠、GitHub Actions 綠燈、退出碼 0。** 沒有任何一處會發出警訊。
+
+這與批次 1 的主題（寫入完整性）是同一類問題的上游版本：失敗被 fail-open 吞掉且無人知曉。
+
+**設計取捨**：不改成「任一來源失敗就整個中止」——那會讓一個來源的暫時性問題阻擋其他兩個來源的正常更新。改為**資料面 fail-open、訊號面 fail-loud**：能抓多少寫多少，但只要有來源全滅或寫入失敗，退出碼為 1 讓 CI 紅燈。
+
+- [ ] **Step 1: 寫失敗測試**
+
+```python
+    def test_12_find_missing_sources(self):
+        """要求：能偵測出「某個來源本次一篇都沒抓到」"""
+        from main_pipeline import EXPECTED_SOURCES, find_missing_sources
+
+        full = [{"source": s} for s in EXPECTED_SOURCES]
+        self.assertEqual(find_missing_sources(full), set(),
+                         "三個來源都有產出時不應回報缺漏")
+
+        without_hpa = [a for a in full if a["source"] != "衛福部闢謠網站"]
+        self.assertEqual(find_missing_sources(without_hpa), {"衛福部闢謠網站"},
+                         "衛福部全滅時必須被指名")
+
+        self.assertEqual(find_missing_sources([]), set(EXPECTED_SOURCES),
+                         "完全沒抓到任何文章時，三個來源都算缺漏")
+
+        # 數量不影響判定——只要有產出就算通過
+        one_each = [{"source": s} for s in EXPECTED_SOURCES]
+        self.assertEqual(find_missing_sources(one_each), set())
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `.venv/bin/python test_system.py TestHealthETLPipeline.test_12_find_missing_sources -v`
+Expected: FAIL — `ImportError: cannot import name 'EXPECTED_SOURCES' from 'main_pipeline'`
+
+- [ ] **Step 3: 實作純函式**
+
+`main_pipeline.py` 檔頭附近（`chunk_text` 之前）加入：
+
+```python
+# 三個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
+# 任一來源本次一篇都沒抓到，就是異常——見 find_missing_sources 的說明。
+EXPECTED_SOURCES = frozenset({
+    "食藥署闢謠專區",
+    "衛福部闢謠網站",
+    "台灣事實查核中心",
+})
+
+
+def find_missing_sources(articles, expected=EXPECTED_SOURCES):
+    """回傳本次完全沒有產出任何文章的來源名稱集合。
+
+    為什麼需要這個檢查：兩支爬蟲模組都用 `except Exception: print(...)`
+    處理失敗，函式仍會正常回傳（只是少了那個來源的資料）。若沒有這層檢查，
+    一個來源可以連續數週完全抓不到東西，而 ETL 每天照常「成功」結束、
+    CI 一路綠燈——實際發生過：衛福部因伺服器未附中繼憑證而 TLS 驗證失敗，
+    測試套件卻全綠（見 Task 4）。
+
+    刻意只看「有沒有產出」而不看數量：來源本身的文章數會自然波動，
+    設數量門檻會產生假警報；而「一篇都沒有」幾乎必然是故障。
+    """
+    seen = {a.get("source") for a in articles}
+    return set(expected) - seen
+```
+
+- [ ] **Step 4: 執行測試確認通過**
+
+Run: `.venv/bin/python test_system.py TestHealthETLPipeline.test_12_find_missing_sources -v`
+Expected: PASS
+
+- [ ] **Step 5: `job()` 回傳狀態碼，`__main__` 據以退出**
+
+`job()` 改為：
+
+```python
+def job():
+    """執行一次完整 ETL。回傳 0 表示正常，1 表示有來源全滅或寫入失敗。"""
+    print(f"\n=== 🟢 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動正式爬蟲任務 ===")
+    print("\n[階段一：呼叫爬蟲模組提取資料]")
+    all_articles = []
+
+    all_articles.extend(get_api_articles(test_mode=False))
+    all_articles.extend(get_tfc_articles(test_mode=False))
+
+    print(f"\n🏁 階段一完成！總共收集到 {len(all_articles)} 篇待處理的文章。")
+
+    exit_code = 0
+    missing = find_missing_sources(all_articles)
+    if missing:
+        print(f"\n❌ 嚴重：以下來源本次完全沒有取得任何文章：{'、'.join(sorted(missing))}")
+        print("   這通常代表爬蟲失效、來源網站改版、或網路／憑證問題。")
+        print("   請檢查上方該來源的錯誤訊息。本次執行將以非零狀態碼結束。")
+        exit_code = 1
+
+    print("\n[階段二：切片與上傳]")
+    try:
+        client = MongoClient(MONGO_URI)
+        collection = client["CARE_database"]["health_articles_chunks"]
+        total_new = upload_to_mongodb(all_articles, collection)
+        print(f"\n=== 🔴 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 任務結束！成功上傳了 {total_new} 篇全新文章 ===")
+    except Exception as e:
+        print(f"❌ 嚴重：MongoDB 連線或上傳失敗: {e}")
+        print("   本次執行將以非零狀態碼結束。")
+        exit_code = 1
+
+    return exit_code
+```
+
+`__main__` 區塊改為：
+
+```python
+if __name__ == "__main__":
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        print("☁️ 偵測到雲端 GitHub Actions 環境，啟動單次排程任務...")
+        sys.exit(job())          # 非零退出碼讓 Actions 顯示紅燈
+    else:
+        print("💻 偵測到本地開發環境，啟動常駐排程系統...")
+        print("每天早上 08:00 將自動執行爬蟲任務。")
+        job()                    # 常駐模式不因單次失敗結束程序
+        schedule.every().day.at("08:00").do(job)
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+```
+
+檔頭需 `import sys`（原本沒有，要加）。
+
+**注意**：常駐排程模式**刻意不**因單次失敗而終止程序——本機開發時不該因為一次網路問題就讓排程死掉。只有 CI 的單次執行才需要非零退出碼。
+
+- [ ] **Step 6: 跑全套並 Commit**
+
+```bash
+.venv/bin/python test_system.py -v
+git add main_pipeline.py test_system.py
+git commit -m "fix(etl): 來源全滅或寫入失敗時以非零狀態碼結束"
+```
+
+- [ ] **Step 7: 更新 openspec change 的 spec delta**
+
+本 task 新增了一條 requirement，需補進
+`openspec/changes/etl-write-integrity/specs/etl-ingestion/spec.md`（append 到現有的
+`## ADDED Requirements` 之下，不要新增第二個 `## ADDED Requirements` 標題）：
+
+```markdown
+### Requirement: 來源失效必須可見
+
+當任一資料來源在一次執行中完全沒有產出任何文章，或知識庫寫入階段失敗時，系統 SHALL 以非零狀態碼結束該次執行（CI 單次執行模式），SHALL NOT 以成功狀態結束。常駐排程模式 SHALL NOT 因單次失敗而終止程序。
+
+#### Scenario: 單一來源完全失效
+
+- **WHEN** 三個來源中有一個在本次執行未產出任何文章
+- **THEN** 其餘來源的文章仍照常寫入知識庫，且該次執行以非零狀態碼結束並指名該來源
+
+#### Scenario: 寫入階段失敗
+
+- **WHEN** MongoDB 連線或寫入拋出例外
+- **THEN** 該次執行以非零狀態碼結束
+```
+
+同步在 `openspec/changes/etl-write-integrity/tasks.md` 補一節對應本 task，並跑
+`openspec validate etl-write-integrity --strict` 確認通過。
+
+---
+
+### Task 7: openspec change `etl-content-quality` 骨架
 
 **Files:**
 - Create: `openspec/changes/etl-content-quality/.openspec.yaml`
@@ -788,7 +973,7 @@ git commit -m "chore: 刪除過時副本 test_pipeline.py
 
 **Interfaces:**
 - Consumes: Task 1–5 完成的批次 1
-- Produces: 供 Task 7–11 勾選的 `tasks.md`
+- Produces: 供 Task 8–12 勾選的 `tasks.md`
 
 - [ ] **Step 1: `.openspec.yaml`**（`schema: spec-driven` / `created: 2026-08-09`）
 
@@ -845,7 +1030,7 @@ embedding 指定 `RETRIEVAL_DOCUMENT`、改用批次端點、以新 collection �
 `## Risks` 需含：taskType 改變後排序品質的實際影響**未經 A/B 驗證**，
 建議分兩階段重建（見 Task 11 Step 5）以取得歸因。
 
-- [ ] **Step 4: `tasks.md`**（對應 Task 7–11，引用測試名稱，含 DoD）
+- [ ] **Step 4: `tasks.md`**（對應 Task 8–12，引用測試名稱，含 DoD）
 
 - [ ] **Step 5: `specs/etl-content/spec.md`**
 
@@ -898,7 +1083,7 @@ git commit -m "docs(openspec): 新增 etl-content-quality change 提案"
 
 ---
 
-### Task 7: `clean_html` 改 BS4 並保留段落
+### Task 8: `clean_html` 改 BS4 並保留段落
 
 **Files:**
 - Modify: `utils.py`
@@ -1003,7 +1188,7 @@ git commit -m "fix(etl): clean_html 改用 BeautifulSoup 並保留段落結構"
 
 ---
 
-### Task 8: `chunk_text` 改句界切分
+### Task 9: `chunk_text` 改句界切分
 
 **Files:**
 - Modify: `main_pipeline.py`（`chunk_text`）
@@ -1116,7 +1301,7 @@ git commit -m "fix(etl): chunk_text 改依句界切分，消除斷句與殘渣"
 
 ---
 
-### Task 9: 標題落地 `chunk_content` + `taskType`
+### Task 10: 標題落地 `chunk_content` + `taskType`
 
 **Files:**
 - Modify: `main_pipeline.py`（`get_embedding`、`upload_to_mongodb`）
@@ -1217,7 +1402,7 @@ git commit -m "feat(etl): 標題落地 chunk_content 並指定 RETRIEVAL_DOCUMEN
 
 ---
 
-### Task 10: 改用批次 embedding 端點
+### Task 11: 改用批次 embedding 端點
 
 **Files:**
 - Modify: `main_pipeline.py`（新增 `get_embeddings_batch`）
@@ -1341,7 +1526,7 @@ git commit -m "perf(etl): 改用 batchEmbedContents，單篇一次呼叫"
 
 ---
 
-### Task 11: 遷移腳本 —— v2 collection + 雙來源回填
+### Task 12: 遷移腳本 —— v2 collection + 雙來源回填
 
 **Files:**
 - Create: `migrate_rebuild.py`
