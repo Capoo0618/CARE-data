@@ -191,6 +191,26 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertIn("https://example.com/new", written_urls,
                       "第 2 篇是新文章，不應因為第 1 篇已存在而被跳過")
 
+    def test_07_url_none_articles_dedup_by_title_only(self):
+        """要求：url 為 None 的文章（食藥署）以標題去重，且不同標題不得互相碰撞"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": None, "original_title": "已存在的文章"},
+        ])
+        articles = [
+            {"title": "已存在的文章", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
+            {"title": "全新文章A", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
+            {"title": "全新文章B", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
+        ]
+
+        upload_to_mongodb(articles, collection, embed_fn=fake_embed_ok)
+
+        written = {d["original_title"] for b in collection.inserted_batches for d in b}
+        self.assertNotIn("已存在的文章", written, "標題已存在者應跳過")
+        self.assertEqual(written, {"全新文章A", "全新文章B"},
+                         "兩篇 url 皆為 None 但標題不同的文章，不得被視為重複")
+
 if __name__ == '__main__':
     print("==================================================")
     print(" 🏥 ETL 資料管線 - 單元測試與一致性驗證啟動")
