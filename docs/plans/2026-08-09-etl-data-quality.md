@@ -576,40 +576,159 @@ git commit -m "feat(etl): 保存發布／修改日期，並依修改日期重寫
 
 ---
 
-### Task 4: 移除 `verify=False`
+### Task 4: 移除 `verify=False`，改用釘選中繼憑證的 CA bundle
 
 **Files:**
-- Modify: `scraper_api.py:32`
-- Modify: `scraper_tfc.py:37,86`
-- Test: 既有 `test_02` / `test_03` 覆蓋（它們會實際連線）
+- Create: `certs/twca_secure_ssl_ca.pem`（已由 controller 取得並放置，見下）
+- Create: `ca_bundle.py`
+- Modify: `scraper_api.py`、`scraper_tfc.py`、`test_system.py`
+- Modify: `requirements.txt`（新增 `certifi`）
+- Test: `test_system.py` 新增 `test_11_ca_bundle_contains_pinned_intermediate`
 
-**Interfaces:** Consumes/Produces：無
+**Interfaces:**
+- Consumes: 無
+- Produces: `ca_bundle.get_ca_bundle() -> str`（回傳合併後 CA bundle 的檔案路徑）
 
-- [ ] **Step 1: 移除三處 `verify=False` 與相關的警告抑制**
+**背景 —— 為何不能直接拿掉 `verify=False`**
 
-三支檔案中把 `requests.get(..., verify=False)` 的 `verify=False` 拿掉。
-若移除後 `urllib3.disable_warnings(...)` 已無作用，一併移除該行與 `import urllib3`
-（`test_system.py` 的 `urllib3` 匯入保留——它自己也有 `verify=False`，見 Step 3）。
+實測（三個來源，`verify=True`）：
 
-- [ ] **Step 2: 執行測試確認來源網站憑證正常**
+| 來源 | 結果 |
+| --- | --- |
+| 食藥署 `fda.gov.tw` | HTTP 200 |
+| 台灣事實查核中心 `tfc-taiwan.org.tw` | HTTP 200 |
+| **衛福部 `www.hpa.gov.tw`** | **SSLError** |
 
-Run: `python test_system.py TestHealthETLPipeline.test_02_api_data_integrity TestHealthETLPipeline.test_03_tfc_data_integrity -v`
-Expected: PASS。
+`openssl s_client` 顯示衛福部伺服器**只送出 leaf 憑證、未附中繼憑證**
+（`Verify return code: 21 (unable to verify the first certificate)`）。
+瀏覽器與 macOS 的 curl 會依 leaf 憑證中的 AIA 欄位自動補抓中繼憑證，
+Python 的 `ssl` 模組不會 —— 所以只有 Python 連不上。
 
-**若任一來源出現 SSL 憑證錯誤：停下來回報，不要把 `verify=False` 加回去。**
-政府網站憑證鏈不完整是真實情況，正確處理是指定 CA bundle 或記錄為已知限制，
-而不是全域關閉驗證——把判斷交給人。
+leaf 憑證的 AIA 欄位指向：
+`http://sslserver.twca.com.tw/cacert/secure_sha2_2023G3.crt`
 
-- [ ] **Step 3: `test_system.py` 內的 `verify=False` 一併處理**
+該中繼憑證已下載並存於 `certs/twca_secure_ssl_ca.pem`：
 
-該檔第 38、65 行的比對請求也用了 `verify=False`。若 Step 2 證實來源憑證正常，
-一併移除，保持整個 repo 一致。
+```
+subject     = C=TW, O=TAIWAN-CA, CN=TWCA Secure SSL Certification Authority
+issuer      = C=TW, O=TAIWAN-CA, OU=Root CA, CN=TWCA Global Root CA
+notBefore   = Oct 16 09:01:04 2023 GMT
+notAfter    = Oct 16 15:59:59 2030 GMT
+SHA256      = 1A:2C:75:FD:09:6E:04:99:E9:FF:6A:C7:4E:52:6F:61:EA:AE:3E:DF:C8:C2:EA:44:36:FE:E0:C2:4D:8B:7D:0E
+```
 
-- [ ] **Step 4: Commit**
+controller 已驗證鏈完整性：
+`openssl verify -CAfile <certifi + 本憑證> -untrusted certs/twca_secure_ssl_ca.pem hpa_leaf.pem` → `OK`
+
+這是**公開資料**（任何人連上衛福部都能取得同一張），不是憑證私鑰、不是機密。
+
+- [ ] **Step 1: 寫失敗測試**
+
+加到 `test_system.py`（沿用既有 `unittest` 風格）：
+
+```python
+    def test_11_ca_bundle_contains_pinned_intermediate(self):
+        """要求：CA bundle 同時含 certifi 根憑證與釘選的 TWCA 中繼憑證"""
+        import certifi
+        from ca_bundle import get_ca_bundle
+
+        bundle_path = get_ca_bundle()
+        bundle = open(bundle_path, encoding="utf-8").read()
+        certifi_content = open(certifi.where(), encoding="utf-8").read()
+        pinned = open("certs/twca_secure_ssl_ca.pem", encoding="utf-8").read()
+
+        self.assertIn(pinned.strip(), bundle, "bundle 必須包含釘選的 TWCA 中繼憑證")
+        self.assertIn(certifi_content[:200], bundle, "bundle 必須保留 certifi 的根憑證清單")
+        self.assertGreater(len(bundle), len(certifi_content),
+                           "bundle 應為 certifi 的超集，而非取代它")
+```
+
+- [ ] **Step 2: 執行測試確認失敗**
+
+Run: `.venv/bin/python test_system.py TestHealthETLPipeline.test_11_ca_bundle_contains_pinned_intermediate -v`
+Expected: FAIL — `ModuleNotFoundError: No module named 'ca_bundle'`
+
+- [ ] **Step 3: 建立 `ca_bundle.py`**
+
+```python
+"""合併 certifi 根憑證與手動釘選的中繼憑證，供 requests 的 verify= 使用。
+
+為什麼需要這個檔案：衛福部（www.hpa.gov.tw）的伺服器只送出 leaf 憑證、
+沒有附上中繼憑證 TWCA Secure SSL Certification Authority。瀏覽器與
+macOS 的 curl 會依 leaf 憑證的 AIA 欄位自動補抓，但 Python 的 ssl 模組不會，
+因此 requests 會拋 SSLError。
+
+以往的做法是 verify=False——那等於對所有來源關閉憑證驗證，中間人攻擊
+完全無法偵測。這裡改為「信任原本那批根憑證，外加 TWCA 這一張中繼憑證」，
+驗證仍然有效。
+
+釘選的憑證是公開資料（任何人連上衛福部都能取得同一張），存於
+certs/twca_secure_ssl_ca.pem，有效期至 2030-10-16。到期後衛福部會連不上
+並拋出明確的 SSLError——這是刻意的：大聲失敗遠優於 verify=False 那種
+默默什麼都不檢查。屆時重新從 leaf 憑證的 AIA 網址下載新的一張即可。
+"""
+
+import atexit
+import os
+import tempfile
+
+import certifi
+
+_PINNED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
+_bundle_path = None
+
+
+def get_ca_bundle() -> str:
+    """回傳合併後 CA bundle 的檔案路徑（同一程序內只建立一次）。"""
+    global _bundle_path
+    if _bundle_path and os.path.exists(_bundle_path):
+        return _bundle_path
+
+    parts = [open(certifi.where(), encoding="utf-8").read()]
+    for name in sorted(os.listdir(_PINNED_DIR)):
+        if name.endswith(".pem"):
+            with open(os.path.join(_PINNED_DIR, name), encoding="utf-8") as fh:
+                parts.append(fh.read())
+
+    fd, path = tempfile.mkstemp(prefix="care_data_ca_", suffix=".pem")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(p.strip() + "\n" for p in parts))
+
+    atexit.register(lambda: os.path.exists(path) and os.unlink(path))
+    _bundle_path = path
+    return path
+```
+
+- [ ] **Step 4: 執行測試確認通過**
+
+Run: `.venv/bin/python test_system.py TestHealthETLPipeline.test_11_ca_bundle_contains_pinned_intermediate -v`
+Expected: PASS
+
+- [ ] **Step 5: 三支爬蟲改用 bundle，移除 `verify=False`**
+
+`scraper_api.py`、`scraper_tfc.py`：檔頭 `from ca_bundle import get_ca_bundle`，
+把三處 `requests.get(..., verify=False)` 改為 `verify=get_ca_bundle()`，
+並移除 `urllib3.disable_warnings(...)` 與 `import urllib3`（確認該檔案已無其他用途才移除）。
+
+`test_system.py` 的兩處比對請求（約第 38、65 行）同樣處理。
+
+`requirements.txt` 新增 `certifi`（requests 本來就會帶進來，但既然直接 import 就該明列）。
+
+- [ ] **Step 6: 三個來源實際連線驗證（本 task 的核心證據）**
+
+Run: `.venv/bin/python test_system.py -v`
+
+必須逐一確認三個來源都以**啟用憑證驗證**的方式連線成功：
+食藥署、衛福部、台灣事實查核中心。把三者的實際結果寫進報告。
+
+**若衛福部仍失敗，停下來回報** —— 代表釘選的憑證不是正確的那張，或鏈仍不完整。
+**不可以把 `verify=False` 加回去。**
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add scraper_api.py scraper_tfc.py test_system.py
-git commit -m "fix(etl): 移除 verify=False，恢復 TLS 憑證驗證"
+git add certs ca_bundle.py scraper_api.py scraper_tfc.py test_system.py requirements.txt
+git commit -m "fix(etl): 以釘選中繼憑證的 CA bundle 取代 verify=False"
 ```
 
 ---
