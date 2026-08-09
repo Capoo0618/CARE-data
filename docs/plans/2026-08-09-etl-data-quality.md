@@ -363,6 +363,33 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
     return new_count
 ```
 
+- [ ] **Step 3b: 補 `url=None` 去重的守護測試**
+
+食藥署那批文章 `url` 恆為 `None`（`scraper_api.py:44-45` 的 fallback 鏈條在該來源必然落空），
+去重只能靠標題。Task 3 會再次修改 `upload_to_mongodb`，需要一個守護測試防止這條路徑被靜默破壞：
+
+```python
+    def test_07_url_none_articles_dedup_by_title_only(self):
+        """要求：url 為 None 的文章（食藥署）以標題去重，且不同標題不得互相碰撞"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": None, "original_title": "已存在的文章"},
+        ])
+        articles = [
+            {"title": "已存在的文章", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
+            {"title": "全新文章A", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
+            {"title": "全新文章B", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
+        ]
+
+        upload_to_mongodb(articles, collection, embed_fn=fake_embed_ok)
+
+        written = {d["original_title"] for b in collection.inserted_batches for d in b}
+        self.assertNotIn("已存在的文章", written, "標題已存在者應跳過")
+        self.assertEqual(written, {"全新文章A", "全新文章B"},
+                         "兩篇 url 皆為 None 但標題不同的文章，不得被視為重複")
+```
+
 - [ ] **Step 4: 執行測試確認通過**
 
 Run: `python test_system.py TestHealthETLPipeline.test_04_partial_embedding_failure_writes_nothing TestHealthETLPipeline.test_05_all_chunks_succeed_writes_once TestHealthETLPipeline.test_06_existing_article_does_not_skip_rest_of_source -v`
@@ -397,7 +424,7 @@ git commit -m "fix(etl): 寫入改為全有或全無，去重判定由來源降�
 - [ ] **Step 1: 寫失敗測試**
 
 ```python
-    def test_07_updated_article_replaces_old_chunks(self):
+    def test_08_updated_article_replaces_old_chunks(self):
         """要求：來源修改日期改變時，舊 chunk 全部清掉重寫"""
         from main_pipeline import upload_to_mongodb
 
@@ -418,7 +445,7 @@ git commit -m "fix(etl): 寫入改為全有或全無，去重判定由來源降�
         self.assertEqual(len(collection.inserted_batches), 1, "應重新寫入新版本")
         self.assertEqual(collection.inserted_batches[0][0]["updated_at"], "2026-08-01")
 
-    def test_08_unchanged_article_is_skipped(self):
+    def test_09_unchanged_article_is_skipped(self):
         """要求：修改日期相同時維持跳過，不重複嵌入"""
         from main_pipeline import upload_to_mongodb
 
@@ -439,7 +466,7 @@ git commit -m "fix(etl): 寫入改為全有或全無，去重判定由來源降�
 
 - [ ] **Step 2: 執行測試確認失敗**
 
-Run: `python test_system.py TestHealthETLPipeline.test_07_updated_article_replaces_old_chunks -v`
+Run: `python test_system.py TestHealthETLPipeline.test_08_updated_article_replaces_old_chunks -v`
 Expected: FAIL — 舊 chunk 未被刪除（`deleted_filters` 為空）
 
 - [ ] **Step 3: `scraper_api.py` 帶出日期欄位**

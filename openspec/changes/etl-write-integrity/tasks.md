@@ -10,7 +10,7 @@
 - [ ] 2.1 `scraper_api.py`：`get_api_articles` 回傳的文章 dict 新增 `published_at` / `updated_at` 兩個鍵；衛福部闢謠網站（HPA）來源填入 API 回應中的修改日期欄位，食藥署無對應欄位時填 `None`
 - [ ] 2.2 `scraper_tfc.py`：回傳的文章 dict 同步補上 `published_at` / `updated_at`（皆為 `None`，該來源不提供修改日期），讓兩支爬蟲回傳的鍵集合一致
 - [ ] 2.3 `main_pipeline.py`：`upload_to_mongodb` 寫入的文件新增 `published_at` / `updated_at` 欄位；當來源提供 `updated_at` 且與資料庫中既有值不同時，先刪除該篇既有的所有 chunk，再以新內容重新寫入
-- [ ] 2.4 測試（純函式／寫入邏輯單元測試——依賴注入假件，不得發出真實網路請求）：`test_system.py` 新增 `test_07_updated_article_replaces_old_chunks`、`test_08_unchanged_article_is_skipped`
+- [ ] 2.4 測試（純函式／寫入邏輯單元測試——依賴注入假件，不得發出真實網路請求）：`test_system.py` 新增 `test_08_updated_article_replaces_old_chunks`、`test_09_unchanged_article_is_skipped`
 
 ## 3. 移除 `verify=False`
 
