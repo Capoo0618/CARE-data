@@ -1,11 +1,8 @@
 import time
 import requests
-import urllib3
 from bs4 import BeautifulSoup
+from ca_bundle import get_ca_bundle
 from utils import clean_html
-
-# 關閉憑證警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_tfc_articles(test_mode=False, start_page=1, max_pages=2): # 注意這裡把 start_page 預設改成 1 了
     source_name = "台灣事實查核中心"
@@ -34,7 +31,7 @@ def get_tfc_articles(test_mode=False, start_page=1, max_pages=2): # 注意這裡
         print(f"\n  📄 正在爬取第 {current_page} 頁的列表: {page_url}")
         
         try:
-            response = requests.get(page_url, headers=headers, timeout=15, verify=False)
+            response = requests.get(page_url, headers=headers, timeout=15, verify=get_ca_bundle())
             
             # 如果對方伺服器對於不存在的頁面回傳 404，requests 會拋出 HTTPError，我們可以藉此知道翻到底了
             if response.status_code == 404:
@@ -83,7 +80,7 @@ def get_tfc_articles(test_mode=False, start_page=1, max_pages=2): # 注意這裡
                 time.sleep(2)
                 
                 try:
-                    detail_res = requests.get(link, headers=headers, timeout=15, verify=False)
+                    detail_res = requests.get(link, headers=headers, timeout=15, verify=get_ca_bundle())
                     detail_soup = BeautifulSoup(detail_res.content, 'html.parser')
                     paragraphs = detail_soup.find_all('p')
                     raw_content = " ".join([p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 20])

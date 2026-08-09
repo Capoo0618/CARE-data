@@ -1,13 +1,10 @@
 import unittest
 import requests
-import urllib3
 from bs4 import BeautifulSoup
+from ca_bundle import get_ca_bundle
 from utils import clean_html
 from scraper_api import get_api_articles
 from scraper_tfc import get_tfc_articles
-
-# 關閉測試時的憑證警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class FakeCollection:
@@ -78,7 +75,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         """測試要求 2：確保 API 爬蟲資料與來源網站「一模一樣」"""
         # 1. 模擬人工：當下直接去食藥署 API 看最原始的第一筆資料
         raw_url = "https://www.fda.gov.tw/DataAction"
-        res = requests.get(raw_url, verify=False, timeout=10)
+        res = requests.get(raw_url, verify=get_ca_bundle(), timeout=10)
         raw_data = res.json()
         # 食藥署的標題欄位可能是 "標題" 或 "Title"
         expected_title = raw_data[0].get("標題", raw_data[0].get("Title", "")).strip()
@@ -105,7 +102,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         # 1. 模擬人工：當下用最原始的方式去 TFC 健康專區把第一篇文章標題硬生生抓下來
         raw_url = "https://tfc-taiwan.org.tw/fact-check-report-type/health/"
         headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(raw_url, headers=headers, verify=False, timeout=10)
+        res = requests.get(raw_url, headers=headers, verify=get_ca_bundle(), timeout=10)
         soup = BeautifulSoup(res.content, 'html.parser')
         
         expected_title = ""
@@ -272,6 +269,21 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertTrue(any(d.get("url") == "https://example.com/a"
                             for d in collection.docs),
                         "舊版本必須原封不動留在庫中")
+
+    def test_11_ca_bundle_contains_pinned_intermediate(self):
+        """要求：CA bundle 同時含 certifi 根憑證與釘選的 TWCA 中繼憑證"""
+        import certifi
+        from ca_bundle import get_ca_bundle
+
+        bundle_path = get_ca_bundle()
+        bundle = open(bundle_path, encoding="utf-8").read()
+        certifi_content = open(certifi.where(), encoding="utf-8").read()
+        pinned = open("certs/twca_secure_ssl_ca.pem", encoding="utf-8").read()
+
+        self.assertIn(pinned.strip(), bundle, "bundle 必須包含釘選的 TWCA 中繼憑證")
+        self.assertIn(certifi_content[:200], bundle, "bundle 必須保留 certifi 的根憑證清單")
+        self.assertGreater(len(bundle), len(certifi_content),
+                           "bundle 應為 certifi 的超集，而非取代它")
 
 if __name__ == '__main__':
     print("==================================================")

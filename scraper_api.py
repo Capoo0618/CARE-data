@@ -1,11 +1,8 @@
 # scraper_api.py
 import time
 import requests
-import urllib3
+from ca_bundle import get_ca_bundle
 from utils import clean_html
-
-# 關閉憑證警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_api_articles(test_mode=False):
     """
@@ -29,7 +26,7 @@ def get_api_articles(test_mode=False):
         print(f"\n[{source['name']}] 開始抓取 API: {source['url']}")
         try:
             time.sleep(1) 
-            response = requests.get(source['url'], headers=headers, timeout=15, verify=False)
+            response = requests.get(source['url'], headers=headers, timeout=15, verify=get_ca_bundle())
             response.raise_for_status()
             raw_data = response.json()
             
