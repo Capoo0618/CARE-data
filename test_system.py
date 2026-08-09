@@ -45,6 +45,11 @@ class FakeCollection:
         self.update_many_calls.append((filt, update))
         return changed
 
+    def count_documents(self, filt):
+        """只支援 {"url": ...} 條件 —— 與 main_pipeline 實際用法一致。"""
+        url = filt.get("url")
+        return sum(1 for doc in self.docs if doc.get("url") == url)
+
 
 def fake_embed_ok(text):
     return [0.1, 0.2, 0.3]
@@ -433,6 +438,79 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertEqual(collection.deleted_filters, [], "不應刪除舊版")
         self.assertEqual(len(collection.docs), 1)
         self.assertEqual(collection.docs[0]["chunk_content"], "舊內容")
+
+    def test_17_incomplete_legacy_article_is_repaired(self):
+        """既有文章的實際切片數與宣告的 total_chunks 不符時，重寫修復。
+
+        這是本 change 的第一個動機：舊版逐塊寫入在某塊向量化失敗時只印警告，
+        其餘照常寫入，留下「宣告 4 塊、實際 3 塊」的破洞，且該篇之後會被判定
+        「已存在」而永遠跳過。線上實測有 71 篇這樣的文章、遺失約 141 個切片。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/hole", "original_title": "破洞文章",
+             "chunk_content": "第一塊", "chunk_index": 1, "total_chunks": 3,
+             "embedding": [0.1]},
+            {"url": "https://example.tw/hole", "original_title": "破洞文章",
+             "chunk_content": "第三塊", "chunk_index": 3, "total_chunks": 3,
+             "embedding": [0.1]},
+        ])
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/hole",
+            "title": "破洞文章", "content": "完整的新內容",
+            "published_at": "2024/01/01", "updated_at": "2024/03/15",
+        }
+
+        new_count, write_failed = upload_to_mongodb(
+            [article], collection, embed_fn=fake_embed_ok)
+
+        self.assertFalse(write_failed)
+        self.assertEqual(new_count, 1, "破洞文章應被重寫")
+        self.assertEqual(len(collection.deleted_filters), 1,
+                         "應刪除既有的不完整切片")
+        self.assertTrue(
+            all(d["chunk_content"] != "第一塊" for d in collection.docs),
+            "舊的不完整切片不應留下")
+        self.assertEqual(collection.docs[0]["total_chunks"], len(collection.docs),
+                         "重寫後宣告值必須與實際切片數一致")
+        self.assertEqual(collection.docs[0]["updated_at"], "2024/03/15")
+
+    def test_18_complete_legacy_article_is_only_backfilled(self):
+        """既有文章切片數與宣告值相符時，仍然只補日期、不重算向量。
+
+        守住 Task 7 的成果：新增的破洞檢查不得誤觸發，
+        否則又會回到「全量 2,840 個切片重算」的狀態。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/ok", "original_title": "完整文章",
+             "chunk_content": "第一塊", "chunk_index": 1, "total_chunks": 2,
+             "embedding": [0.1]},
+            {"url": "https://example.tw/ok", "original_title": "完整文章",
+             "chunk_content": "第二塊", "chunk_index": 2, "total_chunks": 2,
+             "embedding": [0.1]},
+        ])
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/ok",
+            "title": "完整文章", "content": "新內容",
+            "published_at": "2024/01/01", "updated_at": "2024/03/15",
+        }
+
+        calls = []
+
+        def counting_embed(text):
+            calls.append(text)
+            return [0.5] * 3072
+
+        upload_to_mongodb([article], collection, embed_fn=counting_embed)
+
+        self.assertEqual(calls, [], "完整的既有文章不應重新向量化")
+        self.assertEqual(collection.deleted_filters, [], "不應刪除任何切片")
+        self.assertEqual(len(collection.docs), 2)
+        self.assertTrue(all(d["updated_at"] == "2024/03/15" for d in collection.docs),
+                        "所有切片都要補上日期")
 
 if __name__ == '__main__':
     print("==================================================")

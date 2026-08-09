@@ -106,26 +106,38 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
             incoming_updated = article.get("updated_at")
             needs_rewrite = False
             if url and incoming_updated:
-                old = collection.find_one({"url": url}, {"updated_at": 1})
+                old = collection.find_one({"url": url},
+                                          {"updated_at": 1, "total_chunks": 1})
                 if old is not None:
                     old_updated = old.get("updated_at")
                     if old_updated is None:
                         # 這一篇是本次變更之前寫入的，沒有日期可比對。
-                        # 只補中繼資料、不重新向量化：把「沒有日期」當成「日期不同」
-                        # 會讓合併後首次執行重算全部既有切片（衛福部約 2,840 個，
-                        # 每個切片有 2 秒節流，實際要跑數小時且極可能耗盡 Gemini 配額），
-                        # 換來的只是內容多半相同的重算。補上日期之後，
-                        # 之後每一次真正的改版都能正常偵測。
-                        # 代價：若某篇在本次變更之前就已於來源改版，那一次改版會被漏掉。
-                        # 這是一次性且有界的，遠低於全量重算的成本。
-                        collection.update_many(
-                            {"url": url},
-                            {"$set": {
-                                "published_at": article.get("published_at"),
-                                "updated_at": incoming_updated,
-                            }},
-                        )
-                        print(f"  📌 補上日期欄位（既有資料，不重算向量）: {title[:15]}...")
+                        # 先確認它是不是舊版逐塊寫入留下的破洞：舊版在某塊向量化
+                        # 失敗時只印警告、其餘照常寫入，於是宣告的 total_chunks
+                        # 與實際筆數不符，而該篇之後會被判定「已存在」永遠跳過。
+                        # 線上實測有 71 篇這樣的文章、遺失約 141 個切片。
+                        declared = old.get("total_chunks")
+                        actual = collection.count_documents({"url": url})
+                        if declared is not None and actual != declared:
+                            print(f"  🔧 既有文章不完整（宣告 {declared} 塊、"
+                                  f"實際 {actual} 塊），將重寫修復: {title[:15]}...")
+                            needs_rewrite = True
+                        else:
+                            # 完整的既有文章只補中繼資料、不重新向量化：把「沒有日期」
+                            # 當成「日期不同」會讓合併後首次執行重算全部既有切片
+                            # （衛福部約 2,840 個，每個切片有 2 秒節流，實際要跑數小時
+                            # 且極可能耗盡 Gemini 配額），換來的只是內容多半相同的重算。
+                            # 補上日期之後，之後每一次真正的改版都能正常偵測。
+                            # 代價：若某篇在本次變更之前就已於來源改版，那一次改版會被
+                            # 漏掉。這是一次性且有界的，遠低於全量重算的成本。
+                            collection.update_many(
+                                {"url": url},
+                                {"$set": {
+                                    "published_at": article.get("published_at"),
+                                    "updated_at": incoming_updated,
+                                }},
+                            )
+                            print(f"  📌 補上日期欄位（既有資料，不重算向量）: {title[:15]}...")
                     elif old_updated != incoming_updated:
                         print(f"  🔄 偵測到改版，將重寫: {title[:15]}...")
                         needs_rewrite = True
@@ -184,7 +196,7 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
             # 但一定要回報，讓 job() 以非零狀態碼結束——訊號面 fail-loud。
             write_failed = True
             ident = article.get("url") or article.get("title") or "（無法辨識）"
-            print(f"  ❌ 這篇處理失敗，其餘文章照常繼續：{ident} —— {e}")
+            print(f"  ❌ 這篇處理失敗，其餘文章照常繼續：{ident} —— {type(e).__name__}: {e}")
             if deleted_old:
                 print("     ⚠️ 舊版切片已刪除但新版尚未寫入。此 URL 已不在庫中，"
                       "下次執行會當成全新文章重新寫入，暴露時間最長一個排程週期。")
