@@ -26,12 +26,13 @@ context: |
   下游契約（改動前務必確認）：
     CARE Backend 讀取的欄位為 chunk_content（內文）、embedding（3072 維）、
     source_name、url、original_title、chunk_index、total_chunks。
-    Atlas 有兩個索引：vector_index（vectorSearch，3072/cosine）與
+    Atlas 有兩個索引（資訊來自 CARE Backend 的 docs/care-data-issues.md，
+    未於本 repo 直接驗證）：vector_index（vectorSearch，3072／cosine）與
     care_text_index（Atlas Search，analyzer 須為 lucene.cjk，中文才切得動）。
     任何改變 chunk_content 內容或 embedding 產生方式的變更，都會使既有向量失效，
     需全量重建並與 CARE 端協調 cutover。
 
-  工作流程：
+  工作流程（本 change 採用的慣例，供參考；是否採用由 repo 維護者決定）：
   1. openspec new <change>；於 changes/<change>/ 撰寫 proposal → design（可選）→ tasks
   2. 開 branch 實作，維持小步、聚焦單一變更
   3. python test_system.py 全綠才算完成
