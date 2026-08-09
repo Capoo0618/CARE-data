@@ -32,7 +32,9 @@ context: |
     任何改變 chunk_content 內容或 embedding 產生方式的變更，都會使既有向量失效，
     需全量重建並與 CARE 端協調 cutover。
 
-  工作流程（本 change 採用的慣例，供參考；是否採用由 repo 維護者決定）：
+  工作流程（本 change 採用的慣例，供參考；是否採用由 repo 維護者決定。
+  第 1 與第 5 步需要 openspec CLI；不安裝也不影響 ETL 執行或測試，
+  changes/ 底下就是純 Markdown，直接讀寫即可）：
   1. openspec new <change>；於 changes/<change>/ 撰寫 proposal → design（可選）→ tasks
   2. 開 branch 實作，維持小步、聚焦單一變更
   3. python test_system.py 全綠才算完成

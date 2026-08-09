@@ -77,7 +77,7 @@ CARE-data/
 │   └── workflows/
 │       └── etl_pipeline.yml      # GitHub Actions 排程
 ├── openspec/                     # 規格與進行中的變更（spec-driven 工作流程）
-├── certs/                        # 釘選的中繼憑證（公開資料）
+├── certs/                        # 釘選的中繼憑證（公開資料，見 certs/README.md）
 ├── main_pipeline.py              # ETL 主流程
 ├── scraper_api.py                # 政府 API 爬蟲
 ├── scraper_tfc.py                # 台灣事實查核中心爬蟲
