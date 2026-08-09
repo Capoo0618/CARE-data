@@ -39,9 +39,11 @@ class FakeCollection:
         self.docs.extend(docs)
 
     def delete_many(self, query):
+        """支援 {"url": ...} 與 {"original_title": ...} —— 與 main_pipeline
+        實際用法一致（url 為 None 的來源以標題為刪除鍵）。"""
         self.deleted_filters.append(query)
-        url = query.get("url")
-        self.docs = [d for d in self.docs if d.get("url") != url]
+        self.docs = [d for d in self.docs
+                     if not all(d.get(k) == v for k, v in query.items())]
 
     def update_many(self, filt, update):
         """只支援 {"url": ...} 條件與 $set —— 與 main_pipeline 實際用法一致。"""
@@ -548,6 +550,137 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertTrue(any(d.get("url") == "https://example.com/hole-fail"
                             for d in collection.docs),
                         "舊版本必須原封不動留在庫中")
+
+    def test_20_partial_insert_is_rolled_back(self):
+        """insert_many 寫到一半失敗時，殘留的切片必須被清除。
+
+        pymongo 的 insert_many 預設 ordered=True：伺服器逐筆寫入，中途出錯
+        只中止「剩下的」，已經寫進去的不會回滾。若放著不管，這一篇就會變成
+        「宣告 N 塊、實際少於 N 塊」——正是本次變更要消滅的破洞形態。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        class PrefixInsertCollection(FakeCollection):
+            """模擬真實 pymongo：寫入前兩筆之後才拋錯。"""
+
+            def insert_many(self, docs):
+                docs = list(docs)
+                self.inserted_batches.append(docs)
+                self.docs.extend(docs[:2])
+                raise RuntimeError("模擬 Atlas 中途連線中斷")
+
+        collection = PrefixInsertCollection([])
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/partial",
+            "title": "會寫到一半的文章", "content": "內容" * 600,
+            "updated_at": None,
+        }
+
+        new_count, write_failed = upload_to_mongodb(
+            [article], collection, embed_fn=fake_embed_ok)
+
+        self.assertTrue(write_failed)
+        self.assertEqual(new_count, 0)
+        self.assertEqual(
+            [d for d in collection.docs
+             if d.get("url") == "https://example.tw/partial"],
+            [],
+            "殘留的切片必須被清除，否則會留下宣告與實際不符的破洞")
+
+    def test_21_hole_is_repaired_even_after_updated_at_is_set(self):
+        """完整性檢查每次執行都跑，不只在尚未補日期的文章上。
+
+        若只在 `updated_at is None` 時檢查，這道防線在首次執行之後就變成
+        死程式碼；而寫入中途失敗留下的破洞會帶著 updated_at，
+        於是永遠被判定「已存在」而跳過。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/later", "original_title": "後來破的文章",
+             "chunk_content": "第一塊", "chunk_index": 1, "total_chunks": 4,
+             "embedding": [0.1], "updated_at": "2024/06/01"},
+        ])
+        article = {
+            "source": "衛福部闢謠網站", "url": "https://example.tw/later",
+            "title": "後來破的文章", "content": "重新取得的完整內容",
+            "updated_at": "2024/06/01",
+        }
+
+        new_count, write_failed = upload_to_mongodb(
+            [article], collection, embed_fn=fake_embed_ok)
+
+        self.assertFalse(write_failed)
+        self.assertEqual(new_count, 1, "日期相同但切片數不符時仍須修復")
+        self.assertEqual(len(collection.deleted_filters), 1)
+        self.assertEqual(collection.docs[0]["total_chunks"], len(collection.docs))
+
+    def test_22_systematic_embedding_failure_is_reported(self):
+        """有嘗試但一篇都沒成功時必須回報失敗（配額用盡的情境）。
+
+        爬蟲成功、三個來源都有文章，所以來源檢查看不到這個問題。
+        沒有這道判斷，知識庫可以連續數週停止更新而 CI 一路綠燈。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([])
+        articles = [
+            {"source": "衛福部闢謠網站", "url": f"https://example.tw/{i}",
+             "title": f"文章{i}", "content": "內容", "updated_at": None}
+            for i in range(3)
+        ]
+
+        new_count, write_failed = upload_to_mongodb(
+            articles, collection, embed_fn=lambda text: [])
+
+        self.assertEqual(new_count, 0)
+        self.assertTrue(write_failed,
+                        "全數向量化失敗必須讓 job() 以非零狀態碼結束")
+
+    def test_23_single_embedding_failure_does_not_fail_the_run(self):
+        """單篇偶發向量化失敗不應讓整次執行紅燈。
+
+        每天為了一篇失敗而紅燈，只會訓練維護者忽略 CI。
+        那一篇下次執行就會補上。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([])
+        articles = [
+            {"source": "衛福部闢謠網站", "url": "https://example.tw/a",
+             "title": "會失敗的文章", "content": "內容", "updated_at": None},
+            {"source": "衛福部闢謠網站", "url": "https://example.tw/b",
+             "title": "會成功的文章", "content": "內容", "updated_at": None},
+        ]
+
+        new_count, write_failed = upload_to_mongodb(
+            articles, collection, embed_fn=make_failing_embed(1))
+
+        self.assertEqual(new_count, 1)
+        self.assertFalse(write_failed, "只要有文章成功寫入就不算系統性失敗")
+
+    def test_24_empty_title_article_is_written_at_most_once(self):
+        """標題為空字串的文章不得每天重複寫入。
+
+        食藥署的 706 篇文章 url 全為 None，標題是唯一的去重鍵。
+        若把空字串當成「沒有標題」濾掉，這種文章每次執行都會被當成新文章，
+        知識庫會無上限地累積重複切片，直接汙染下游 RAG 的檢索結果。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([])
+        article = {
+            "source": "食藥署闢謠專區", "url": None,
+            "title": "", "content": "有內容但沒有標題", "updated_at": None,
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        first_run = len(collection.docs)
+        upload_to_mongodb([dict(article)], collection, embed_fn=fake_embed_ok)
+
+        self.assertEqual(len(collection.docs), first_run,
+                         "第二次執行不應再寫入一次")
+
 
 if __name__ == '__main__':
     print("==================================================")

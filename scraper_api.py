@@ -41,7 +41,10 @@ def get_api_articles(test_mode=False):
                 raw_url = item.get("\u9023\u7d50\u7db2\u5740", item.get("url", item.get("Url", item.get("URL", item.get("連結", None)))))
                 if raw_url == "": raw_url = None
 
-                if not raw_title and not raw_content: continue
+                # 標題或內容任一為空就跳過（原本是 and，兩者都空才跳過）。
+                # 沒有標題的文章去重只能靠空字串當鍵，而且向量化的輸入會變成
+                # 「主題：（空）內容：…」，檢索品質明顯較差——不如不收。
+                if not raw_title or not raw_content: continue
 
                 cleaned_articles.append({
                     "title": raw_title.strip(),
