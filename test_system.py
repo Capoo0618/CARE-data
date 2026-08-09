@@ -9,6 +9,49 @@ from scraper_tfc import get_tfc_articles
 # 關閉測試時的憑證警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+class FakeCollection:
+    """記錄呼叫的假 collection，讓寫入邏輯可在無網路下測試。"""
+
+    def __init__(self, existing=None):
+        self.docs = list(existing or [])
+        self.inserted_batches = []
+        self.deleted_filters = []
+
+    def distinct(self, field):
+        return [d.get(field) for d in self.docs if d.get(field) is not None]
+
+    def find_one(self, query, projection=None):
+        for d in self.docs:
+            if all(d.get(k) == v for k, v in query.items()):
+                return d
+        return None
+
+    def insert_many(self, docs):
+        self.inserted_batches.append(list(docs))
+        self.docs.extend(docs)
+
+    def delete_many(self, query):
+        self.deleted_filters.append(query)
+        url = query.get("url")
+        self.docs = [d for d in self.docs if d.get("url") != url]
+
+
+def fake_embed_ok(text):
+    return [0.1, 0.2, 0.3]
+
+
+def make_failing_embed(fail_on_nth):
+    """第 fail_on_nth 次呼叫回傳空 list（模擬向量化失敗）。"""
+    state = {"n": 0}
+
+    def _embed(text):
+        state["n"] += 1
+        return [] if state["n"] == fail_on_nth else [0.1, 0.2, 0.3]
+
+    return _embed
+
+
 class TestHealthETLPipeline(unittest.TestCase):
     
     def test_01_clean_html_cases(self):
@@ -89,6 +132,64 @@ class TestHealthETLPipeline(unittest.TestCase):
         # 確保格式欄位齊全
         self.assertIn("content", tfc_first_article)
         self.assertTrue(len(tfc_first_article["content"]) > 50, "內文長度過短，可能抓取失敗")
+
+    def test_04_partial_embedding_failure_writes_nothing(self):
+        """要求：任一 chunk 向量化失敗，整篇都不得寫入（不留破洞）"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection()
+        article = {
+            "title": "測試文章",
+            "content": "第一句。" * 200,   # 確保會切成多個 chunk
+            "source": "測試來源",
+            "url": "https://example.com/a",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=make_failing_embed(2))
+
+        self.assertEqual(collection.inserted_batches, [],
+                         "有 chunk 向量化失敗時，不應寫入任何一筆")
+
+    def test_05_all_chunks_succeed_writes_once(self):
+        """要求：全部成功時以單次批次寫入，且 total_chunks 與實際筆數一致"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection()
+        article = {
+            "title": "測試文章",
+            "content": "第一句。" * 200,
+            "source": "測試來源",
+            "url": "https://example.com/a",
+        }
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+
+        self.assertEqual(len(collection.inserted_batches), 1, "應該只有一次批次寫入")
+        batch = collection.inserted_batches[0]
+        self.assertTrue(len(batch) > 0)
+        for doc in batch:
+            self.assertEqual(doc["total_chunks"], len(batch),
+                             "total_chunks 必須等於實際寫入筆數")
+
+    def test_06_existing_article_does_not_skip_rest_of_source(self):
+        """要求：某篇已存在不得導致同來源後續文章被跳過"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection(existing=[
+            {"url": "https://example.com/old", "original_title": "舊文章"},
+        ])
+        articles = [
+            {"title": "舊文章", "content": "內容。", "source": "同一來源",
+             "url": "https://example.com/old"},
+            {"title": "新文章", "content": "內容。", "source": "同一來源",
+             "url": "https://example.com/new"},
+        ]
+
+        upload_to_mongodb(articles, collection, embed_fn=fake_embed_ok)
+
+        written_urls = {d["url"] for b in collection.inserted_batches for d in b}
+        self.assertIn("https://example.com/new", written_urls,
+                      "第 2 篇是新文章，不應因為第 1 篇已存在而被跳過")
 
 if __name__ == '__main__':
     print("==================================================")

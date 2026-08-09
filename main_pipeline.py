@@ -46,51 +46,71 @@ def get_embedding(text: str, max_retries=3) -> list:
             time.sleep(5)
     return []
 
-def upload_to_mongodb(articles, collection):
+def upload_to_mongodb(articles, collection, *, embed_fn=None):
+    """把文章切片、向量化後寫入 MongoDB。
+
+    寫入保證為「全有或全無」：一篇文章的所有 chunk 都成功取得向量才寫入。
+    任一 chunk 失敗就整篇跳過、留待下次執行重試——避免產生「宣告 4 塊、
+    實際只有 3 塊」這種永遠不會被補上的破洞（線上 pid=16703 即為此類實例）。
+    """
+    embed_fn = embed_fn or get_embedding
     print(f"\n=== 🚀 開始將 {len(articles)} 篇文章上傳至 MongoDB ===")
+
+    # 一次取回既有鍵，取代逐篇 find_one；並讓「已存在」的判定只作用於單篇，
+    # 不再因為某篇已存在就放棄整個來源的後續文章。
+    existing_urls = {u for u in collection.distinct("url") if u}
+    existing_titles = {t for t in collection.distinct("original_title") if t}
+
     new_count = 0
-    skipped_sources = set()
-    
     for article in articles:
-        source_name = article["source"]
-        if source_name in skipped_sources:
+        url = article.get("url")
+        title = article["title"]
+
+        if (url and url in existing_urls) or title in existing_titles:
+            print(f"  ⏭️ 已存在，跳過: {title[:15]}...")
             continue
 
-        query = {"$or": [{"url": article["url"]}, {"original_title": article["title"]}]}
-        if article["url"] is None:
-            query = {"original_title": article["title"]}
-
-        if collection.find_one(query):
-            print(f"  ⏭️ [{source_name}] 發現已存在資料: {article['title'][:15]}...")
-            print(f"     -> 🛑 觸發提早結束機制，跳過【{source_name}】後續所有文章！")
-            skipped_sources.add(source_name)
-            continue
-        
-        print(f"  🆕 [處理中] 向量化並上傳: {article['title'][:15]}...")
         chunks = chunk_text(article["content"])
-        
-        chunks_inserted = 0
+        if not chunks:
+            print(f"  ⚠️ 內容為空，跳過: {title[:15]}...")
+            continue
+
+        print(f"  🆕 [處理中] 向量化並上傳: {title[:15]}...")
+        vectors = []
+        failed = False
         for i, chunk in enumerate(chunks):
-            vector = get_embedding(f"主題：{article['title']}\n內容：{chunk}")
-            if vector:
-                collection.insert_one({
-                    "source_name": article["source"],
-                    "url": article["url"],
-                    "original_title": article["title"],
-                    "chunk_content": chunk,
-                    "chunk_index": i + 1,
-                    "total_chunks": len(chunks),
-                    "embedding": vector,
-                    "uploaded_at": time.time()
-                })
-                chunks_inserted += 1
-            else:
-                print(f"    ⚠️ 第 {i+1} 個切片失敗！")
-                
-        if chunks_inserted > 0:
-            print(f"    ✅ 成功寫入 {chunks_inserted}/{len(chunks)} 個切片")
-            new_count += 1
-            
+            vector = embed_fn(f"主題：{title}\n內容：{chunk}")
+            if not vector:
+                print(f"    ⚠️ 第 {i+1}/{len(chunks)} 個切片向量化失敗——"
+                      f"整篇跳過，留待下次執行重試")
+                failed = True
+                break
+            vectors.append(vector)
+        if failed:
+            continue
+
+        docs = [
+            {
+                "source_name": article["source"],
+                "url": url,
+                "original_title": title,
+                "chunk_content": chunk,
+                "chunk_index": i + 1,
+                "total_chunks": len(chunks),
+                "embedding": vector,
+                "uploaded_at": time.time(),
+            }
+            for i, (chunk, vector) in enumerate(zip(chunks, vectors))
+        ]
+        collection.insert_many(docs)
+        print(f"    ✅ 成功寫入 {len(docs)} 個切片")
+
+        # 讓同一批次內的重複文章也能被擋掉
+        if url:
+            existing_urls.add(url)
+        existing_titles.add(title)
+        new_count += 1
+
     return new_count
 
 def job():
