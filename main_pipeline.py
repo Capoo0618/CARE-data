@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import requests
 import schedule
@@ -13,6 +14,31 @@ from scraper_tfc import get_tfc_articles
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
+
+# 三個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
+# 任一來源本次一篇都沒抓到，就是異常——見 find_missing_sources 的說明。
+EXPECTED_SOURCES = frozenset({
+    "食藥署闢謠專區",
+    "衛福部闢謠網站",
+    "台灣事實查核中心",
+})
+
+
+def find_missing_sources(articles, expected=EXPECTED_SOURCES):
+    """回傳本次完全沒有產出任何文章的來源名稱集合。
+
+    為什麼需要這個檢查：兩支爬蟲模組都用 `except Exception: print(...)`
+    處理失敗，函式仍會正常回傳（只是少了那個來源的資料）。若沒有這層檢查，
+    一個來源可以連續數週完全抓不到東西，而 ETL 每天照常「成功」結束、
+    CI 一路綠燈——實際發生過：衛福部因伺服器未附中繼憑證而 TLS 驗證失敗，
+    測試套件卻全綠（見 Task 4）。
+
+    刻意只看「有沒有產出」而不看數量：來源本身的文章數會自然波動，
+    設數量門檻會產生假警報；而「一篇都沒有」幾乎必然是故障。
+    """
+    seen = {a.get("source") for a in articles}
+    return set(expected) - seen
+
 
 def chunk_text(text: str, chunk_size=500, overlap=50) -> list:
     if not text: return []
@@ -130,14 +156,24 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
     return new_count
 
 def job():
+    """執行一次完整 ETL。回傳 0 表示正常，1 表示有來源全滅或寫入失敗。"""
     print(f"\n=== 🟢 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動正式爬蟲任務 ===")
     print("\n[階段一：呼叫爬蟲模組提取資料]")
     all_articles = []
-    
-    all_articles.extend(get_api_articles(test_mode=False)) 
-    all_articles.extend(get_tfc_articles(test_mode=False)) 
-    
+
+    all_articles.extend(get_api_articles(test_mode=False))
+    all_articles.extend(get_tfc_articles(test_mode=False))
+
     print(f"\n🏁 階段一完成！總共收集到 {len(all_articles)} 篇待處理的文章。")
+
+    exit_code = 0
+    missing = find_missing_sources(all_articles)
+    if missing:
+        print(f"\n❌ 嚴重：以下來源本次完全沒有取得任何文章：{'、'.join(sorted(missing))}")
+        print("   這通常代表爬蟲失效、來源網站改版、或網路／憑證問題。")
+        print("   請檢查上方該來源的錯誤訊息。本次執行將以非零狀態碼結束。")
+        exit_code = 1
+
     print("\n[階段二：切片與上傳]")
     try:
         client = MongoClient(MONGO_URI)
@@ -145,18 +181,22 @@ def job():
         total_new = upload_to_mongodb(all_articles, collection)
         print(f"\n=== 🔴 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 任務結束！成功上傳了 {total_new} 篇全新文章 ===")
     except Exception as e:
-        print(f"MongoDB 連線或上傳失敗: {e}")
+        print(f"❌ 嚴重：MongoDB 連線或上傳失敗: {e}")
+        print("   本次執行將以非零狀態碼結束。")
+        exit_code = 1
+
+    return exit_code
 
 if __name__ == "__main__":
     # 【重點升級】：環境偵測
     # 當運行在 GitHub Actions 時，會自帶 GITHUB_ACTIONS=true 環境變數
     if os.getenv("GITHUB_ACTIONS") == "true":
         print("☁️ 偵測到雲端 GitHub Actions 環境，啟動單次排程任務...")
-        job()
+        sys.exit(job())          # 非零退出碼讓 Actions 顯示紅燈
     else:
         print("💻 偵測到本地開發環境，啟動常駐排程系統...")
         print("每天早上 08:00 將自動執行爬蟲任務。")
-        job() 
+        job()                    # 常駐模式不因單次失敗結束程序
         schedule.every().day.at("08:00").do(job)
         while True:
             schedule.run_pending()

@@ -285,6 +285,25 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertGreater(len(bundle), len(certifi_content),
                            "bundle 應為 certifi 的超集，而非取代它")
 
+    def test_12_find_missing_sources(self):
+        """要求：能偵測出「某個來源本次一篇都沒抓到」"""
+        from main_pipeline import EXPECTED_SOURCES, find_missing_sources
+
+        full = [{"source": s} for s in EXPECTED_SOURCES]
+        self.assertEqual(find_missing_sources(full), set(),
+                         "三個來源都有產出時不應回報缺漏")
+
+        without_hpa = [a for a in full if a["source"] != "衛福部闢謠網站"]
+        self.assertEqual(find_missing_sources(without_hpa), {"衛福部闢謠網站"},
+                         "衛福部全滅時必須被指名")
+
+        self.assertEqual(find_missing_sources([]), set(EXPECTED_SOURCES),
+                         "完全沒抓到任何文章時，三個來源都算缺漏")
+
+        # 數量不影響判定——只要有產出就算通過
+        one_each = [{"source": s} for s in EXPECTED_SOURCES]
+        self.assertEqual(find_missing_sources(one_each), set())
+
 if __name__ == '__main__':
     print("==================================================")
     print(" 🏥 ETL 資料管線 - 單元測試與一致性驗證啟動")
