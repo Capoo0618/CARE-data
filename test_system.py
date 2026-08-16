@@ -1,9 +1,11 @@
+import re
 import unittest
 import requests
 from bs4 import BeautifulSoup
 from ca_bundle import get_ca_bundle
 from utils import clean_html
-from scraper_api import get_api_articles
+from scraper_api import get_api_articles, is_admin_notice
+from scraper_fda import get_fda_articles
 from scraper_tfc import get_tfc_articles
 
 
@@ -100,30 +102,100 @@ class TestHealthETLPipeline(unittest.TestCase):
                 self.assertEqual(result, case["expected"], f"第 {i} 組測試案例失敗：輸入 {case['input']}")
 
     def test_02_api_data_integrity(self):
-        """測試要求 2：確保 API 爬蟲資料與來源網站「一模一樣」"""
-        # 1. 模擬人工：當下直接去食藥署 API 看最原始的第一筆資料
-        raw_url = "https://www.fda.gov.tw/DataAction"
+        """測試要求 2：確保 API 爬蟲資料與來源網站「一模一樣」
+
+        2026-08-16 起這支只負責衛福部——食藥署已改由 scraper_fda 爬闢謠專區，
+        見 test_02b。
+        """
+        # 1. 模擬人工：當下直接去衛福部 API 看最原始的第一筆資料
+        raw_url = "https://www.hpa.gov.tw/wf/newsapi.ashx"
         res = requests.get(raw_url, verify=get_ca_bundle(), timeout=10)
         raw_data = res.json()
-        # 食藥署的標題欄位可能是 "標題" 或 "Title"
-        expected_title = raw_data[0].get("標題", raw_data[0].get("Title", "")).strip()
-        
+        items = raw_data if isinstance(raw_data, list) else raw_data.get("data", [])
+        first = items[0]
+        expected_title = first.get("標題", first.get("Title", first.get("title", ""))).strip()
+
         # 2. 呼叫我們的模組
         articles = get_api_articles(test_mode=True)
-        
-        # 3. 找出模組抓到的「食藥署」第一篇文章
-        fda_first_article = next(art for art in articles if art["source"] == "食藥署闢謠專區")
-        
+
+        # 3. 找出模組抓到的「衛福部」第一篇文章
+        hpa_first_article = next(art for art in articles if art["source"] == "衛福部闢謠網站")
+
         # 4. 斷言比對 (Data Integrity Check)
         print(f"\n    🔍 [API 來源原始資料] 最新標題: {expected_title}")
-        print(f"    ✅ [API 爬蟲模組產出] 最終標題: {fda_first_article['title']}")
-        
-        self.assertEqual(fda_first_article["title"], expected_title, 
+        print(f"    ✅ [API 爬蟲模組產出] 最終標題: {hpa_first_article['title']}")
+
+        self.assertEqual(hpa_first_article["title"], expected_title,
                          "API 爬蟲抓取的標題與來源 API 原始資料不一致！")
-        
+
         # 確保格式欄位齊全
-        self.assertIn("content", fda_first_article)
-        self.assertIn("url", fda_first_article)
+        self.assertIn("content", hpa_first_article)
+        self.assertIn("url", hpa_first_article)
+
+    def test_02a_admin_notice_filter(self):
+        """行政公告判準：擋掉法規預告與典禮，但不擋衛教與澄清稿。
+
+        關鍵字是照線上 706 篇標題校準的，這支測試釘住兩端——漏擋會讓雜訊
+        回到知識庫，誤擋會刪掉真正的衛教內容（kb-003 / kb-024 就依賴其中幾篇）。
+        """
+        should_block = [
+            "101年度優良廚師表揚活動",
+            "預告修正「食品業者登錄辦法」第四條，擬納入物流業及倉儲資料",
+            "食藥署舉辦「2025 亞太國際化粧品檢驗技術研討會」",
+            "103年度餐飲業HACCP衛生評鑑綜合座談會暨成果表揚大會",
+            "食藥署公布113年2月21日豬肉檢出西布特羅案專家會議紀錄",
+        ]
+        should_keep = [
+            "守護兒童用藥安全 使用抗生素四不一要",
+            "夏雨綿綿，家中藥品處理報你哉",
+            "讓食藥署教您如何保存與處理家中藥品",
+            "新年到!藥品正確儲存及丟棄三撇步",
+            "安心過好年：春節用藥安全小叮嚀",
+            # 「活動」刻意不是關鍵字——這篇是澄清稿，不是行政公告
+            "食藥署澄清107年並未邀請蕾菈參加本署反毒活動",
+        ]
+        for title in should_block:
+            with self.subTest(block=title):
+                self.assertTrue(is_admin_notice(title), f"應擋下卻放行：{title}")
+        for title in should_keep:
+            with self.subTest(keep=title):
+                self.assertFalse(is_admin_notice(title), f"應保留卻擋下：{title}")
+
+    def test_02b_fda_data_integrity(self):
+        """食藥署闢謠專區爬蟲與來源網頁一致，且每篇都帶得回網址。
+
+        `url` 這個斷言是這支測試存在的主因：舊的 DataAction 端點結構上就
+        給不出文章網址，導致全庫 28.5% 的 chunk 無法在答案中附上可查證的
+        連結，而這件事一路沒被任何測試擋下來。
+        """
+        # 1. 模擬人工：直接去闢謠專區列表頁抓第一篇的 id 與標題
+        raw_url = "https://www.fda.gov.tw/TC/news.aspx?cid=5049&pn=1"
+        res = requests.get(raw_url, headers={"User-Agent": "Mozilla/5.0"},
+                           verify=get_ca_bundle(), timeout=15)
+        soup = BeautifulSoup(res.content, "html.parser")
+        first_link = next(a for a in soup.find_all("a")
+                          if "newsContent.aspx?cid=5049&id=" in (a.get("href") or ""))
+        expected_title = first_link.get_text(strip=True)
+        expected_id = re.search(r"id=(\d+)", first_link["href"]).group(1)
+
+        # 2. 呼叫我們的模組
+        articles = get_fda_articles(test_mode=True)
+        self.assertTrue(articles, "食藥署闢謠專區一篇都沒抓到")
+        first = articles[0]
+
+        print(f"\n    🔍 [闢謠專區列表頁] 最新標題: {expected_title}")
+        print(f"    ✅ [FDA 爬蟲模組產出] 最終標題: {first['title']}")
+
+        self.assertEqual(first["title"], expected_title,
+                         "FDA 爬蟲抓取的標題與來源網頁不一致！")
+
+        # 3. 每篇都必須有可點的文章網址——這正是換掉舊來源的理由
+        for art in articles:
+            self.assertEqual(art["source"], "食藥署闢謠專區")
+            self.assertTrue(art["url"], f"《{art['title']}》沒有 url")
+            self.assertIn("newsContent.aspx?cid=5049&id=", art["url"])
+            self.assertTrue(art["content"].strip(), f"《{art['title']}》內容是空的")
+        self.assertIn(expected_id, first["url"])
 
     def test_03_tfc_data_integrity(self):
         """測試要求 2：確保 TFC 網頁爬蟲資料與網站「一模一樣」"""
@@ -806,9 +878,14 @@ class TestHealthETLPipeline(unittest.TestCase):
     # job() 的退出碼
     # ------------------------------------------------------------------
 
-    def _three_source_articles(self):
+    def _all_source_articles(self):
+        """每個 EXPECTED_SOURCES 各一篇。新增來源時這裡必須跟著加，
+        否則 find_missing_sources 會判定該來源全滅而讓退出碼變 1。"""
         return [
-            {"source": "食藥署闢謠專區", "url": None, "title": "食藥署文章",
+            {"source": "食藥署闢謠專區",
+             "url": "https://www.fda.gov.tw/TC/newsContent.aspx?cid=5049&id=1",
+             "title": "闢謠專區文章", "content": "內容", "updated_at": None},
+            {"source": "食藥署公告", "url": None, "title": "食藥署公告文章",
              "content": "內容", "updated_at": None},
             {"source": "衛福部闢謠網站", "url": "https://example.tw/hpa",
              "title": "衛福部文章", "content": "內容", "updated_at": None},
@@ -817,7 +894,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         ]
 
     def test_29_job_returns_zero_when_everything_succeeds(self):
-        """三個來源都有產出且寫入成功時，退出碼為 0。
+        """每個來源都有產出且寫入成功時，退出碼為 0。
 
         這是防止「修過頭」的守衛：若有人讓 job() 永遠回傳 1，CI 會天天紅燈，
         維護者很快就會忽略它。
@@ -825,14 +902,14 @@ class TestHealthETLPipeline(unittest.TestCase):
         from main_pipeline import job
 
         collection = FakeCollection([])
-        articles = self._three_source_articles()
+        articles = self._all_source_articles()
 
         rc = job(fetchers=(lambda: articles,),
                  collection_factory=lambda: collection,
                  embed_fn=fake_embed_ok)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(len(collection.docs), 3)
+        self.assertEqual(len(collection.docs), len(articles))
 
     def test_30_job_returns_one_on_missing_source_but_still_writes_others(self):
         """來源全滅時退出碼為 1，但其餘來源的文章仍照常寫入。
@@ -843,7 +920,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         from main_pipeline import job
 
         collection = FakeCollection([])
-        articles = [a for a in self._three_source_articles()
+        articles = [a for a in self._all_source_articles()
                     if a["source"] != "台灣事實查核中心"]
 
         rc = job(fetchers=(lambda: articles,),
@@ -851,7 +928,7 @@ class TestHealthETLPipeline(unittest.TestCase):
                  embed_fn=fake_embed_ok)
 
         self.assertEqual(rc, 1, "有來源一篇都沒抓到必須讓 CI 紅燈")
-        self.assertEqual(len(collection.docs), 2,
+        self.assertEqual(len(collection.docs), len(articles),
                          "其餘來源的文章仍須照常寫入——不得提早 return")
 
     def test_31_job_returns_one_when_collection_is_unreachable(self):
@@ -861,7 +938,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         def unreachable():
             raise RuntimeError("模擬 Atlas 連線失敗")
 
-        rc = job(fetchers=(lambda: self._three_source_articles(),),
+        rc = job(fetchers=(lambda: self._all_source_articles(),),
                  collection_factory=unreachable,
                  embed_fn=fake_embed_ok)
 
@@ -877,7 +954,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         collection = FailingInsert([])
 
-        rc = job(fetchers=(lambda: self._three_source_articles(),),
+        rc = job(fetchers=(lambda: self._all_source_articles(),),
                  collection_factory=lambda: collection,
                  embed_fn=fake_embed_ok)
 

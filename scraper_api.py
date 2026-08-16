@@ -4,14 +4,44 @@ import requests
 from ca_bundle import get_ca_bundle
 from utils import clean_html
 
+# 食藥署 `DataAction` 是全站新聞稿 feed，裡面約兩成是與衛教無關的行政公告
+# （法規預告、研討會、表揚、會議紀錄）。它們進了知識庫只會在檢索時跟真正的
+# 衛教內容競爭名額，所以在來源端就擋掉。
+#
+# 關鍵字是照實際標題校準的，不是憑印象列的：對線上 706 篇比對後命中 129 篇
+# (18%)，逐條抽查確認沒有誤殺。「活動」刻意不列入——它只多命中一篇
+# 〈食藥署澄清107年並未邀請蕾菈參加本署反毒活動〉，而那其實是澄清稿。
+ADMIN_NOISE_KEYWORDS = (
+    "預告", "研討會", "會議", "表揚", "圓滿落幕", "公告修正", "訪查", "頒獎",
+    "成果發表", "簽署", "論壇", "座談會", "評鑑", "備忘錄", "揭牌", "記者會",
+    "招標", "徵才", "人事", "研習", "開幕", "參訪", "年度計畫", "培訓",
+    "觀摩", "競賽", "徵選", "頒發", "授證",
+)
+
+
+def is_admin_notice(title: str) -> bool:
+    """這篇是行政公告（而非衛教內容）嗎？"""
+    return any(kw in (title or "") for kw in ADMIN_NOISE_KEYWORDS)
+
 def get_api_articles(test_mode=False):
     """
-    爬取政府公開資料 API (食藥署、衛福部闢謠專區)
+    爬取政府公開資料 API (食藥署公告、衛福部闢謠專區)
     :param test_mode: 若為 True，每個來源只抓取前 3 篇作為測試。
     :return: 回傳包含字典的 List，格式與 TFC 爬蟲完全相同
+
+    食藥署這個 `DataAction` 端點在 2026-08-16 之前被標成「食藥署闢謠專區」，
+    那是誤標：它回傳的是**全站新聞稿 feed**，706 篇裡只有 6 篇標題含「謠」字。
+    真正的闢謠專區在 news.aspx?cid=5049，已另由 scraper_fda.py 負責。
+
+    這個 feed 仍然保留，因為它跟闢謠專區**完全不重疊**，且含有真正有用的
+    衛教內容（用藥安全、藥品保存與丟棄）。只做兩件事：改成誠實的來源名
+    「食藥署公告」，並在來源端濾掉行政公告。
+
+    已知限制：這個端點結構上就不提供文章網址，因此本來源的 url 恆為 None，
+    答案中無法附上可點的連結。闢謠專區沒有這個問題。
     """
     api_sources = [
-        {"url": "https://www.fda.gov.tw/DataAction", "name": "食藥署闢謠專區"},
+        {"url": "https://www.fda.gov.tw/DataAction", "name": "食藥署公告"},
         {"url": "https://www.hpa.gov.tw/wf/newsapi.ashx", "name": "衛福部闢謠網站"}
     ]
     
@@ -45,6 +75,11 @@ def get_api_articles(test_mode=False):
                 # 沒有標題的文章去重只能靠空字串當鍵，而且向量化的輸入會變成
                 # 「主題：（空）內容：…」，檢索品質明顯較差——不如不收。
                 if not raw_title or not raw_content: continue
+
+                # 行政公告不進知識庫（見 ADMIN_NOISE_KEYWORDS）。只套用在
+                # 食藥署那個 feed——衛福部闢謠網站本來就沒有這類內容。
+                if source["name"] == "食藥署公告" and is_admin_notice(raw_title):
+                    continue
 
                 cleaned_articles.append({
                     "title": raw_title.strip(),
