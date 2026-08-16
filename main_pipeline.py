@@ -146,11 +146,17 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                     # 補上日期之後，之後每一次真正的改版都能正常偵測。
                     # 代價：若某篇在本次變更之前就已於來源改版，那一次改版會被
                     # 漏掉。這是一次性且有界的，遠低於全量重算的成本。
+                    # verdict／claim 一併補上：它們是中繼資料，跟切片內容無關，
+                    # 不補的話既有的 TFC 文章會永遠沒有判定標籤——這一支只在
+                    # 「已存在」時執行，之後再也不會有機會回頭寫。
                     collection.update_many(
                         {"url": url},
                         {"$set": {
                             "published_at": article.get("published_at"),
                             "updated_at": incoming_updated,
+                            "verdict": article.get("verdict"),
+                            "verdict_slug": article.get("verdict_slug"),
+                            "claim": article.get("claim"),
                         }},
                     )
                     print(f"  📌 補上日期欄位（既有資料，不重算向量）: {title[:15]}...")
@@ -183,6 +189,9 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                 embed_failed += 1
                 continue
 
+            # verdict／claim 只有查核型來源（TFC）給得出來，其餘來源為 None。
+            # 刻意寫進每個 chunk 而不是另開集合：下游 RAG 是以 chunk 為單位
+            # 檢索的，判定必須跟著檢索結果一起回去，否則還要多一次查詢。
             docs = [
                 {
                     "source_name": article["source"],
@@ -195,6 +204,9 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                     "uploaded_at": time.time(),
                     "published_at": article.get("published_at"),
                     "updated_at": article.get("updated_at"),
+                    "verdict": article.get("verdict"),
+                    "verdict_slug": article.get("verdict_slug"),
+                    "claim": article.get("claim"),
                 }
                 for i, (chunk, vector) in enumerate(zip(chunks, vectors))
             ]

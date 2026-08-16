@@ -223,12 +223,53 @@ class TestHealthETLPipeline(unittest.TestCase):
         print(f"\n    🔍 [TFC 網頁當前顯示] 最新標題: {expected_title}")
         print(f"    ✅ [TFC 爬蟲模組產出] 最終標題: {tfc_first_article['title']}")
         
-        self.assertEqual(tfc_first_article["title"], expected_title, 
+        # 比對前先把連續空白收斂：列表頁 anchor 與詳細頁 <title> 對同一個標題
+        # 的空白處理不一致（站方 WordPress 產出的差異），逐字元比對會因此假性
+        # 失敗。這裡要驗的是「沒有漏字、沒有切錯」，不是空白的位元組相同。
+        def _norm(text):
+            return re.sub(r"\s+", " ", text).strip()
+
+        self.assertEqual(_norm(tfc_first_article["title"]), _norm(expected_title),
                          "TFC 爬蟲抓取的標題與網頁當前顯示的第一篇標題不一致！")
-        
+
         # 確保格式欄位齊全
         self.assertIn("content", tfc_first_article)
         self.assertTrue(len(tfc_first_article["content"]) > 50, "內文長度過短，可能抓取失敗")
+
+    def test_03a_tfc_carries_verdict_claim_and_dates(self):
+        """TFC 是唯一本來就在做查核的來源，判定標籤必須跟著資料一起回來。
+
+        這三個欄位是後續判定功能的地基：verdict 由專業查核組織標註，省下自行
+        標註與 LLM 猜測；沒有它們，TFC 與其他三個來源就只是「又一批健康文章」。
+        """
+        articles = get_tfc_articles(test_mode=True)
+        self.assertTrue(articles, "TFC 一篇都沒抓到")
+
+        allowed = {"錯誤", "部分錯誤", "正確", "事實釐清", "證據不足"}
+        for art in articles:
+            with self.subTest(title=art["title"][:20]):
+                self.assertEqual(art["source"], "台灣事實查核中心")
+                self.assertTrue(art["url"].startswith(
+                    "https://tfc-taiwan.org.tw/fact-check-reports/"))
+                # 判定：slug 與中文名必須成對，且落在 TFC 官方五分類內
+                self.assertIsNotNone(art["verdict_slug"], "取不到判定 slug")
+                self.assertIn(art["verdict"], allowed)
+                # 日期：舊版寫死 None，改版偵測因此完全失效
+                self.assertRegex(art["published_at"] or "", r"^\d{4}-\d{2}-\d{2}$")
+                self.assertRegex(art["updated_at"] or "", r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_03b_tfc_content_excludes_boilerplate(self):
+        """內文只取「背景」「查核」兩節，不得混入頁尾與募款區塊。
+
+        舊版把所有長度 >20 的 <p> 串起來，導航、關於我們、支持事實查核那些固定
+        文案會一起進向量庫，在檢索時與真正的查核內容競爭。
+        """
+        articles = get_tfc_articles(test_mode=True)
+        for art in articles:
+            with self.subTest(title=art["title"][:20]):
+                for boilerplate in ("關於我們", "支持事實查核", "訂閱電子報"):
+                    self.assertNotIn(boilerplate, art["content"],
+                                     f"內文混入頁尾文案「{boilerplate}」")
 
     def test_04_partial_embedding_failure_writes_nothing(self):
         """要求：任一 chunk 向量化失敗，整篇都不得寫入（不留破洞）"""
@@ -455,6 +496,39 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertEqual(collection.docs[0]["published_at"], "2024/01/01")
         self.assertEqual(collection.docs[0]["chunk_content"], "舊內容",
                          "內容不應被更動——本次只補中繼資料")
+
+    def test_13a_legacy_backfill_also_fills_verdict_and_claim(self):
+        """補中繼資料時 verdict／claim 也要補上。
+
+        這條路徑只在「文章已存在」時執行，之後不會再有機會回頭寫：漏掉的話，
+        線上既有的 TFC 文章會永遠沒有判定標籤，而那正是查核型來源的價值所在。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://tfc-taiwan.org.tw/fact-check-reports/x",
+             "original_title": "舊查核報告", "chunk_content": "舊內容",
+             "chunk_index": 1, "total_chunks": 1, "embedding": [0.1]},
+        ])
+        article = {
+            "source": "台灣事實查核中心",
+            "url": "https://tfc-taiwan.org.tw/fact-check-reports/x",
+            "title": "舊查核報告", "content": "新內容",
+            "published_at": "2026-07-24", "updated_at": "2026-07-25",
+            "verdict": "錯誤", "verdict_slug": "incorrect",
+            "claim": "網傳「吃X可以治癌」？",
+        }
+
+        def counting_embed(text):
+            raise AssertionError("既有資料不應重新向量化")
+
+        upload_to_mongodb([article], collection, embed_fn=counting_embed)
+
+        doc = collection.docs[0]
+        self.assertEqual(doc["verdict"], "錯誤")
+        self.assertEqual(doc["verdict_slug"], "incorrect")
+        self.assertEqual(doc["claim"], "網傳「吃X可以治癌」？")
+        self.assertEqual(doc["chunk_content"], "舊內容", "內容不應被更動")
 
     def test_14_write_failure_skips_one_article_and_continues(self):
         """單篇寫入失敗只跳過該篇，其餘照常處理，並回報 write_failed=True。
