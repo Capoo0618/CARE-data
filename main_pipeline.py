@@ -8,6 +8,7 @@ from pymongo import MongoClient
 
 # 匯入我們自己寫好的爬蟲模組
 from scraper_api import get_api_articles
+from scraper_fda import get_fda_articles
 from scraper_tfc import get_tfc_articles
 
 # 載入環境變數
@@ -18,7 +19,11 @@ MONGO_URI = os.getenv("MONGO_URI")
 # 三個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
 # 任一來源本次一篇都沒抓到，就是異常——見 find_missing_sources 的說明。
 EXPECTED_SOURCES = frozenset({
+    # 真正的闢謠專區（scraper_fda，有文章網址）
     "食藥署闢謠專區",
+    # 食藥署全站新聞稿 feed（scraper_api，無網址）。2026-08-16 之前這批被
+    # 誤標成「食藥署闢謠專區」，見 scraper_api.get_api_articles 的說明。
+    "食藥署公告",
     "衛福部闢謠網站",
     "台灣事實查核中心",
 })
@@ -260,6 +265,7 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
     if fetchers is None:
         fetchers = (
             lambda: get_api_articles(test_mode=False),
+            lambda: get_fda_articles(test_mode=False),
             lambda: get_tfc_articles(test_mode=False),
         )
     collection_factory = collection_factory or _default_collection
