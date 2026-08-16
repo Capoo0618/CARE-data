@@ -8,12 +8,27 @@
 
 ## 資料來源
 
-| 來源名稱 | 模組 | 取得方式 | 有文章網址 | 可偵測改版 |
-|---|---|---|---|---|
-| 食藥署闢謠專區 | `scraper_fda.py` | 爬 `news.aspx?cid=5049` | ✅ | ✅ 維護日期 |
-| 食藥署公告 | `scraper_api.py` | `DataAction` API | ❌ 上游未提供 | ❌ |
-| 衛福部闢謠網站 | `scraper_api.py` | `newsapi.ashx` API | ✅ | ✅ 修改日期 |
-| 台灣事實查核中心 | `scraper_tfc.py` | 爬網頁列表 | ✅ | ❌ |
+| 來源名稱 | 模組 | 取得方式 | 有文章網址 | 可偵測改版 | 有判定標籤 |
+|---|---|---|---|---|---|
+| 食藥署闢謠專區 | `scraper_fda.py` | 爬 `news.aspx?cid=5049` | ✅ | ✅ 維護日期 | ❌ |
+| 食藥署公告 | `scraper_api.py` | `DataAction` API | ❌ 上游未提供 | ❌ | ❌ |
+| 衛福部闢謠網站 | `scraper_api.py` | `newsapi.ashx` API | ✅ | ✅ 修改日期 | ❌ |
+| 台灣事實查核中心 | `scraper_tfc.py` | 爬網頁列表 | ✅ | ✅ JSON-LD | ✅ **五分類** |
+
+## 判定標籤（僅 TFC）
+
+TFC 是四個來源裡唯一本來就在做查核的——其餘三個是政府機關發布衛教資訊與新聞稿。
+因此 TFC 的文章額外帶三個欄位，寫入每一個 chunk：
+
+| 欄位 | 說明 |
+|---|---|
+| `verdict` | `錯誤`／`部分錯誤`／`正確`／`事實釐清`／`證據不足` |
+| `verdict_slug` | 上述的機器可讀識別碼（`incorrect`、`partially-incorrect`…） |
+| `claim` | 被查核的主張本身，即「網傳『⋯』？」那一句 |
+
+判定取自頁面上的分類連結 **slug** 而非顯示文字——slug 在站方調整文案時不會變。
+分類定義以 [TFC 官方查核指標說明](https://tfc-taiwan.org.tw/fact-checking-indicators-explanation/)
+為準。其他三個來源的這三個欄位恆為 `None`。
 
 「食藥署闢謠專區」與「食藥署公告」是**兩批完全不重疊**的資料，不要混為一談：
 
