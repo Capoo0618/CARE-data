@@ -1057,3 +1057,162 @@ if __name__ == '__main__':
     print("==================================================\n")
     # verbosity=2 會印出每一條詳細的測試名稱，展示給教授看非常加分
     unittest.main(verbosity=2)
+
+class TestTFCLegacyVerdict(unittest.TestCase):
+    """舊站遷移文章的判定來自標題前綴，不是分類連結。"""
+
+    def _soup(self, html):
+        return BeautifulSoup(html, "html.parser")
+
+    def test_classification_link_wins_over_title_prefix(self):
+        """兩者都在時以分類連結為準——那是站方的機器可讀識別碼。"""
+        from scraper_tfc import _extract_verdict
+        html = ('<a href="/fact-check-report-classification/partially-incorrect/">'
+                '部分錯誤</a>')
+        slug, verdict = _extract_verdict(self._soup(html), "【錯誤】網傳「X」？")
+        self.assertEqual(slug, "partially-incorrect")
+        self.assertEqual(verdict, "部分錯誤")
+
+    def test_title_prefix_used_when_no_classification_link(self):
+        """舊站文章（/migration-11252）沒有分類連結，判定在標題前綴。"""
+        from scraper_tfc import _extract_verdict
+        slug, verdict = _extract_verdict(self._soup("<p>沒有分類連結</p>"),
+                                         "【錯誤】網傳「X」？")
+        self.assertEqual(verdict, "錯誤")
+        self.assertTrue(slug.startswith("legacy:"),
+                        "來自標題前綴的判定要標示來源，讓下游分得出差異")
+
+    def test_legacy_only_labels_map_to_official_five(self):
+        """舊站用過但現行分類表沒有的標籤，依 TFC 官方定義歸併。"""
+        from scraper_tfc import _extract_verdict
+        cases = {
+            "假借冠名": "錯誤",      # 官方「錯誤」的定義明列「假借冠名的言論」
+            "詐騙": "錯誤",
+            "易生誤解": "部分錯誤",  # 官方「部分錯誤」涵蓋「片面事實、脈絡有誤」
+        }
+        for prefix, expected in cases.items():
+            with self.subTest(prefix=prefix):
+                _, verdict = _extract_verdict(self._soup("<p/>"), f"【{prefix}】網傳「X」？")
+                self.assertEqual(verdict, expected)
+
+    def test_unknown_prefix_yields_no_verdict(self):
+        """認不得的前綴回 None，不要硬猜——寧可沒有判定也不要給錯的。"""
+        from scraper_tfc import _extract_verdict
+        slug, verdict = _extract_verdict(self._soup("<p/>"), "【某個新標籤】網傳「X」？")
+        self.assertIsNone(verdict)
+        self.assertIsNone(slug)
+
+
+class TestDailyQuotaExhaustion(unittest.TestCase):
+    """每日額度用盡與每分鐘超速是兩回事，處置必須不同。
+
+    2026-08-17 那次執行因為把兩者當同一件事，撞到額度上限後仍每 40 秒重試，
+    空轉 4 小時、觸發 357 次、沒寫進任何一筆，最後被 GitHub Actions 的
+    6 小時上限砍掉。
+    """
+
+    def test_quota_exhaustion_stops_remaining_articles(self):
+        """額度用盡就停止整批——今天剩下的每一次呼叫都注定失敗。"""
+        from main_pipeline import upload_to_mongodb, DailyQuotaExhausted
+
+        collection = FakeCollection([])
+        articles = [
+            {"source": "測試", "url": f"https://example.tw/{i}", "title": f"文章{i}",
+             "content": "內容。" * 50, "updated_at": None}
+            for i in range(5)
+        ]
+
+        calls = {"n": 0}
+
+        def embed_until_quota(text):
+            calls["n"] += 1
+            if calls["n"] > 3:
+                raise DailyQuotaExhausted("quota")
+            return [0.1] * 3072
+
+        upload_to_mongodb(articles, collection, embed_fn=embed_until_quota)
+
+        # 額度用盡後不應再為後續文章呼叫 API
+        self.assertLessEqual(calls["n"], 4,
+                             "額度用盡後仍繼續呼叫，等同 2026-08-17 的空轉")
+
+    def test_progress_is_kept_when_quota_runs_out_midway(self):
+        """中途額度用盡：已完成的照常寫入，未完成的整篇不留。"""
+        from main_pipeline import upload_to_mongodb, DailyQuotaExhausted
+
+        collection = FakeCollection([])
+        articles = [
+            {"source": "測試", "url": "https://example.tw/a", "title": "第一篇",
+             "content": "短內容。", "updated_at": None},
+            {"source": "測試", "url": "https://example.tw/b", "title": "第二篇",
+             "content": "短內容。", "updated_at": None},
+        ]
+
+        calls = {"n": 0}
+
+        def embed_second_fails(text):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise DailyQuotaExhausted("quota")
+            return [0.1] * 3072
+
+        new_count, _ = upload_to_mongodb(articles, collection,
+                                         embed_fn=embed_second_fails)
+
+        self.assertEqual(new_count, 1, "第一篇已完成，應照常寫入")
+        urls = {d["url"] for d in collection.docs}
+        self.assertEqual(urls, {"https://example.tw/a"},
+                         "第二篇未完成，不得留下半截切片")
+
+    def test_transient_rate_limit_still_retries(self):
+        """每分鐘超速仍要重試——不能因為修了額度就把這條路也關掉。"""
+        import main_pipeline
+
+        calls = {"n": 0}
+        posted = []
+
+        class FakeResp:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def fake_post(url, json=None, timeout=None):
+            calls["n"] += 1
+            posted.append(url)
+            if calls["n"] == 1:
+                return FakeResp({"error": {"message": "Quota exceeded ... 429"}})
+            return FakeResp({"embedding": {"values": [0.5] * 3072}})
+
+        orig_post, orig_sleep = main_pipeline.requests.post, main_pipeline.time.sleep
+        main_pipeline.requests.post = fake_post
+        main_pipeline.time.sleep = lambda s: None
+        try:
+            vector = main_pipeline.get_embedding("測試")
+        finally:
+            main_pipeline.requests.post = orig_post
+            main_pipeline.time.sleep = orig_sleep
+
+        self.assertEqual(len(vector), 3072, "第二次就成功了，不該放棄")
+        self.assertEqual(calls["n"], 2)
+
+    def test_persistent_quota_error_raises(self):
+        """連續重試都撞同一面牆 → 判定為額度用盡，拋例外而非無限重試。"""
+        import main_pipeline
+        from main_pipeline import DailyQuotaExhausted
+
+        class FakeResp:
+            def json(self):
+                return {"error": {"message": "Quota exceeded for metric: "
+                                             "embed_content_free_tier_requests, limit: 1000"}}
+
+        orig_post, orig_sleep = main_pipeline.requests.post, main_pipeline.time.sleep
+        main_pipeline.requests.post = lambda *a, **k: FakeResp()
+        main_pipeline.time.sleep = lambda s: None
+        try:
+            with self.assertRaises(DailyQuotaExhausted):
+                main_pipeline.get_embedding("測試")
+        finally:
+            main_pipeline.requests.post = orig_post
+            main_pipeline.time.sleep = orig_sleep
