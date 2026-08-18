@@ -47,6 +47,29 @@ VERDICT_BY_SLUG = {
     "insufficient-evidence": "證據不足",
 }
 
+# TFC 舊站遷移過來的文章（網址形如 /fact-check-reports/migration-11252）沒有分類
+# 連結，判定改以標題前綴「【XXX】」標示。實測 102 篇無分類連結的文章 100% 都有
+# 前綴，因此這是完整的第二條抽取路徑，不是盡力而為的補救。
+#
+# 前四個是官方五分類的直接對應；後三個是舊站用過、現行分類表沒有的標籤，
+# 依 TFC 官方定義歸併：
+#   假借冠名 → 錯誤    官方「錯誤」的定義明列「假借冠名的言論」
+#   詐騙     → 錯誤    詐騙訊息本身即為捏造
+#   易生誤解 → 部分錯誤 官方「部分錯誤」涵蓋「內容為真實但為片面事實、脈絡有誤」
+# 最後三者是歸併判斷而非站方明示，若日後 TFC 恢復這些標籤應重新檢視。
+LEGACY_PREFIX_VERDICT = {
+    "錯誤": "錯誤",
+    "部分錯誤": "部分錯誤",
+    "正確": "正確",
+    "事實釐清": "事實釐清",
+    "證據不足": "證據不足",
+    "假借冠名": "錯誤",
+    "詐騙": "錯誤",
+    "易生誤解": "部分錯誤",
+}
+
+TITLE_PREFIX_RE = re.compile(r"^【([^】]{1,10})】")
+
 # 內文只取這兩節。頁面其餘部分是導航、頁尾、相關文章、募款區塊與「關於我們」，
 # 舊版把所有長度 >20 的 <p> 全部串起來，那些雜訊會一起進向量庫。
 CONTENT_HEADINGS = ("背景", "查核")
@@ -70,17 +93,27 @@ def _report_links(page: int) -> list:
     return links
 
 
-def _extract_verdict(soup) -> tuple:
-    """回傳 (slug, 中文名)。找不到時回 (None, None)。
+def _extract_verdict(soup, title: str = "") -> tuple:
+    """回傳 (slug, 中文名)。兩條路徑都失敗才回 (None, None)。
 
-    只認分類連結；頁尾有一個列出全部五種分類的說明區塊，那裡的文字不是本篇的
-    判定，若改以文字比對就會誤抓。
+    先認分類連結——那是站方的機器可讀識別碼。刻意不改以頁面文字比對：頁尾有
+    一個列出全部五種分類的說明區塊，用文字比對會誤抓成本篇的判定。
+
+    分類連結不存在時（舊站遷移的文章）退而讀標題前綴「【XXX】」。這條路徑沒有
+    slug 可回，因此 slug 以 `legacy:` 前綴標示來源，讓下游分得出判定是怎麼來的。
     """
     for anchor in soup.find_all("a", href=True):
         match = CLASSIFICATION_RE.search(anchor["href"])
         if match:
             slug = match.group(1)
             return slug, VERDICT_BY_SLUG.get(slug)
+
+    prefix_match = TITLE_PREFIX_RE.match(title or "")
+    if prefix_match:
+        prefix = prefix_match.group(1)
+        verdict = LEGACY_PREFIX_VERDICT.get(prefix)
+        if verdict:
+            return f"legacy:{prefix}", verdict
     return None, None
 
 
@@ -160,7 +193,7 @@ def _parse_report(url: str) -> dict | None:
     if not title or not content:
         return None
 
-    verdict_slug, verdict = _extract_verdict(soup)
+    verdict_slug, verdict = _extract_verdict(soup, title)
     published_at, updated_at = _extract_dates(soup)
 
     return {
