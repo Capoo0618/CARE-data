@@ -70,6 +70,10 @@ LEGACY_PREFIX_VERDICT = {
 
 TITLE_PREFIX_RE = re.compile(r"^【([^】]{1,10})】")
 
+# 查核結論的特徵。用來判斷內文抽到的是主張還是結論——舊站文章的內文只有結論，
+# 存進 claim 會讓下游的主張同一性驗證拿使用者的主張去比一句沒有主題的結論句。
+CONCLUSION_RE = re.compile(r"因此|為「?(錯誤|部分錯誤|事實釐清|證據不足)」?訊息")
+
 # 內文只取這兩節。頁面其餘部分是導航、頁尾、相關文章、募款區塊與「關於我們」，
 # 舊版把所有長度 >20 的 <p> 全部串起來，那些雜訊會一起進向量庫。
 CONTENT_HEADINGS = ("背景", "查核")
@@ -117,13 +121,40 @@ def _extract_verdict(soup, title: str = "") -> tuple:
     return None, None
 
 
-def _extract_claim(soup) -> str:
-    """被查核的主張，即頁面上「網傳『⋯』？」那一句。"""
+def _extract_claim(soup, title: str = "") -> str:
+    """被查核的主張，即「網傳『⋯』？」那一句。
+
+    標題有「【判定】」前綴時（舊站遷移的文章）**優先從標題取**，因為那些頁面
+    的內文根本沒有獨立的主張段落——實測其詳細頁符合 `CLAIM_RE` 的元素只有一個，
+    而那是查核結論（「⋯因此，傳言為『部分錯誤』訊息。」）。線上 802 篇裡有
+    143 篇因此把結論存成了主張，而這 143 篇的標題 100% 都帶得出真正的主張：
+
+        claim 欄位   ✗ 傳言說法缺乏醫學根據，過度誇大喝水可治病，因此為「錯誤」訊息。
+        標題去前綴   ✓ 網傳「喝水溫度決定壽命，不用藥、僅用水就能治療心臟病」？
+
+    存錯的後果不只是欄位髒：下游的主張同一性驗證拿使用者的主張去比一句沒有
+    主題的結論句，會判成「不同主張」而放棄一則明明查過的謠言。
+
+    新站文章的標題沒有前綴、內文則有獨立的主張段落，維持原本的內文抽取。
+    """
+    body_claim = ""
     for element in soup.find_all(["p", "h1", "h2", "h3"]):
         text = element.get_text(" ", strip=True)
         if 8 < len(text) < 200 and CLAIM_RE.match(text):
-            return text
-    return ""
+            body_claim = text
+            break
+
+    # 內文抽到真正的主張就用它——它與標題同樣有效，沒有理由覆蓋。只有在抽到
+    # 結論句、或什麼都沒抽到時才退回標題。
+    if body_claim and not CONCLUSION_RE.search(body_claim):
+        return body_claim
+
+    prefix_match = TITLE_PREFIX_RE.match(title or "")
+    if prefix_match:
+        title_claim = title[prefix_match.end():].strip()
+        if title_claim:
+            return title_claim
+    return body_claim
 
 
 def _extract_dates(soup) -> tuple:
@@ -205,7 +236,7 @@ def _parse_report(url: str) -> dict | None:
         "updated_at": updated_at,
         "verdict": verdict,
         "verdict_slug": verdict_slug,
-        "claim": _extract_claim(soup),
+        "claim": _extract_claim(soup, title),
     }
 
 
