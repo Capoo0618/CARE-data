@@ -53,6 +53,16 @@ def chunk_text(text: str, chunk_size=500, overlap=50) -> list:
         start += (chunk_size - overlap)
     return chunks
 
+class DailyQuotaExhausted(Exception):
+    """今日 embedding 額度已用盡——重試無效，只能等隔天。
+
+    與「每分鐘超速」是兩回事，必須分開處理：超速等幾十秒就會過，額度用盡等到
+    明天才會過。舊版把兩者當同一件事，撞到額度上限後仍每 40 秒重試一次，
+    2026-08-17 那次因此空轉 4 小時、觸發 357 次，最後被 GitHub Actions 的
+    6 小時上限砍掉——那 4 小時沒有寫進任何一筆資料。
+    """
+
+
 def get_embedding(text: str, max_retries=3) -> list:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={API_KEY}"
     payload = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
@@ -67,11 +77,21 @@ def get_embedding(text: str, max_retries=3) -> list:
                 error_msg = response_data['error'].get('message', '未知錯誤')
                 print(f"    [向量 API 錯誤] {error_msg}")
                 if "Quota exceeded" in error_msg or "429" in str(error_msg):
+                    if attempt == max_retries - 1:
+                        # 連續重試都撞同一面牆，代表不是短暫超速而是額度用盡。
+                        # 以連續失敗次數判定而非解析錯誤訊息裡的 metric 名稱：
+                        # 訊息格式由 Google 決定，改版就會失準；「retry in 48s」
+                        # 這類提示在每日額度耗盡時也照樣出現，同樣不可信。
+                        raise DailyQuotaExhausted(error_msg)
                     print(f"    ⏳ 觸發 API 限制，等待 40 秒後重試... (第 {attempt+1}/{max_retries} 次)")
                     time.sleep(40)
                     continue 
                 return []
             return response_data.get("embedding", {}).get("values", [])
+        except DailyQuotaExhausted:
+            # 必須排在通用 except 之前，否則會被自己的重試迴圈吞掉——
+            # 那正是這個例外要終結的行為。
+            raise
         except Exception as e:
             print(f"    [向量例外錯誤] {e}")
             time.sleep(5)
@@ -104,6 +124,7 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
     new_count = 0
     write_failed = False
     attempted = 0
+    quota_exhausted = False
     embed_failed = 0
     for article in articles:
         url = None
@@ -178,7 +199,17 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
             vectors = []
             failed = False
             for i, chunk in enumerate(chunks):
-                vector = embed_fn(f"主題：{title}\n內容：{chunk}")
+                try:
+                    vector = embed_fn(f"主題：{title}\n內容：{chunk}")
+                except DailyQuotaExhausted:
+                    # 本篇未完成的切片不寫入（維持「全有或全無」），且不再處理
+                    # 後續文章——今天剩下的每一次呼叫都注定失敗。ETL 是增量的，
+                    # 隔天會從這裡接續。
+                    print(f"\n⏸️ 今日 embedding 額度已用盡，停止本次執行。")
+                    print(f"   已完成的文章都已寫入，未處理的留待下次執行接續。")
+                    quota_exhausted = True
+                    failed = True
+                    break
                 if not vector:
                     print(f"    ⚠️ 第 {i+1}/{len(chunks)} 個切片向量化失敗——"
                           f"整篇跳過，留待下次執行重試")
@@ -187,6 +218,8 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                 vectors.append(vector)
             if failed:
                 embed_failed += 1
+                if quota_exhausted:
+                    break
                 continue
 
             # verdict／claim 只有查核型來源（TFC）給得出來，其餘來源為 None。
@@ -248,6 +281,11 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
 
     if embed_failed:
         print(f"\n⚠️ 本次有 {embed_failed} 篇文章因向量化失敗而未寫入，留待下次執行重試。")
+    if quota_exhausted and new_count:
+        # 有進度就不算失敗：額度用盡是已知、有界、隔天自解的情況，而 ETL 本身
+        # 是增量的。天天紅燈只會訓練維護者忽略 CI，那會讓真正的故障也被忽略。
+        print(f"\n⏸️ 本次因每日額度用盡提前結束，已寫入 {new_count} 篇。")
+        print("   剩餘文章將於下次執行接續，不需要人工介入。")
     if attempted and new_count == 0:
         # 系統性向量化失敗（最常見的是 Gemini 配額用盡）會讓整批一篇都寫不進去，
         # 而來源檢查完全看不到——爬蟲是成功的，三個來源都有回傳文章。

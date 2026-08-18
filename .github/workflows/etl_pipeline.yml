@@ -8,6 +8,10 @@ on:
 jobs:
   run-etl:
     runs-on: ubuntu-latest
+    # 正常一次執行 10 分鐘內；一次性回填因每日 embedding 額度上限會提早結束，
+    # 也不會接近這個值。設 90 分鐘是為了讓「卡住」變成 30 分鐘內就看得見的
+    # 紅燈，而不是像 2026-08-17 那樣空轉滿 6 小時預設上限才被砍。
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
