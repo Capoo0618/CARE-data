@@ -1216,3 +1216,41 @@ class TestDailyQuotaExhaustion(unittest.TestCase):
         finally:
             main_pipeline.requests.post = orig_post
             main_pipeline.time.sleep = orig_sleep
+
+
+class TestTFCClaimExtraction(unittest.TestCase):
+    """舊站文章的主張在標題裡，不在內文。
+
+    那些頁面的內文只有查核結論（「⋯因此，傳言為『部分錯誤』訊息。」），沒有獨立
+    的主張段落。存錯的後果不只是欄位髒：下游的主張同一性驗證會拿使用者的主張去
+    比一句沒有主題的結論句，判成「不同主張」而放棄一則明明查過的謠言。
+    """
+
+    def _soup(self, html):
+        return BeautifulSoup(html, "html.parser")
+
+    def test_legacy_article_takes_claim_from_title_not_conclusion(self):
+        from scraper_tfc import _extract_claim
+        conclusion = ("<p>傳言說法缺乏醫學根據，過度誇大喝水可治病，"
+                      "因此，為「錯誤」訊息。</p>")
+        title = "【錯誤】網傳「喝水溫度決定壽命，僅用水就能治療心臟病」？"
+        claim = _extract_claim(self._soup(conclusion), title)
+        self.assertEqual(claim, "網傳「喝水溫度決定壽命，僅用水就能治療心臟病」？")
+        self.assertNotIn("因此", claim)
+
+    def test_new_article_without_prefix_falls_back_to_body(self):
+        """新站文章的標題沒有前綴，主張在內文的獨立段落裡。"""
+        from scraper_tfc import _extract_claim
+        body = "<p>網傳「疫苗是人口滅絕工具」？</p><p>其他段落</p>"
+        claim = _extract_claim(self._soup(body), "疫苗相關查核報告")
+        self.assertEqual(claim, "網傳「疫苗是人口滅絕工具」？")
+
+    def test_prefix_present_but_nothing_after_it_falls_back_to_body(self):
+        from scraper_tfc import _extract_claim
+        body = "<p>網傳「某個說法」？</p>"
+        claim = _extract_claim(self._soup(body), "【錯誤】")
+        self.assertEqual(claim, "網傳「某個說法」？")
+
+    def test_no_claim_anywhere_returns_empty(self):
+        from scraper_tfc import _extract_claim
+        self.assertEqual(_extract_claim(self._soup("<p>無關內容</p>"), "沒有前綴"), "")
