@@ -45,13 +45,84 @@ def find_missing_sources(articles, expected=EXPECTED_SOURCES):
     return set(expected) - seen
 
 
+# 切塊的分隔階層，由粗到細。每一層都保留在切片尾端（`keepends` 語意），
+# 因為中文的句號本身就是語意邊界的一部分，切掉會讓片段讀起來像斷句。
+# 切塊邏輯的版本。改變切法時要 +1——既有文章會據此逐步重切，不需要手動
+# 全刪重灌。ETL 以 url 判定「已存在」會直接跳過，沒有這個標記的話切法一改，
+# 舊資料就永遠留在舊邊界上（線上 9,182 個切片都是 2026-08-22 之前的硬切）。
+#
+# 重切受每日 embedding 額度限制，會分多天完成；額度用盡時本次執行乾淨結束，
+# 隔天自然接續（見 DailyQuotaExhausted）。
+CHUNKER_VERSION = 2
+
+_SEPARATORS = ("\n\n", "\n", "。", "！", "？", "；", "，")
+
+
+def _split_keeping_separator(text: str, separator: str) -> list:
+    """以 separator 切開，但把 separator 留在前一段的尾端。"""
+    parts = text.split(separator)
+    out = [p + separator for p in parts[:-1]]
+    if parts[-1]:
+        out.append(parts[-1])
+    return out
+
+
+def _recursive_split(text: str, chunk_size: int, separators) -> list:
+    """逐層退讓的切分：先試最粗的分隔，切不夠小才往下一層。
+
+    舊版是 `text[start:start + 500]` 的硬切，完全不看標點——線上 TFC 那批
+    平均每篇 1,578 字、切成 4 片，每一片都從句子中間斷開。語意殘缺的片段
+    直接進向量空間，也直接被下游拿去改寫理由。
+
+    最後一層仍然是字元硬切，因為單一句子也可能超過 chunk_size（線上實測
+    最長的一句有 200 字以上）。那時硬切是唯一選擇，但已經是罕例而非常態。
+    """
+    if len(text) <= chunk_size:
+        return [text] if text.strip() else []
+
+    for index, separator in enumerate(separators):
+        if separator not in text:
+            continue
+        pieces = _split_keeping_separator(text, separator)
+        # 這一層切不動（例如整段只有一個分隔且在結尾），換下一層
+        if len(pieces) <= 1:
+            continue
+
+        chunks, buffer = [], ""
+        for piece in pieces:
+            if len(buffer) + len(piece) <= chunk_size:
+                buffer += piece
+                continue
+            if buffer:
+                chunks.append(buffer)
+            # 單一片段仍超長時，用更細的分隔再切一次
+            if len(piece) > chunk_size:
+                chunks.extend(_recursive_split(piece, chunk_size, separators[index + 1:]))
+                buffer = ""
+            else:
+                buffer = piece
+        if buffer:
+            chunks.append(buffer)
+        return [c for c in chunks if c.strip()]
+
+    # 所有分隔都用盡：硬切
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)
+            if text[i:i + chunk_size].strip()]
+
+
 def chunk_text(text: str, chunk_size=500, overlap=50) -> list:
-    if not text: return []
-    chunks, start = [], 0
-    while start < len(text):
-        chunks.append(text[start:start + chunk_size])
-        start += (chunk_size - overlap)
-    return chunks
+    """把文章切成不超過 chunk_size 的片段，盡量在語意邊界上斷開。
+
+    `overlap` 保留參數以維持既有呼叫端相容，但**不再使用**：邊界感知的切分
+    本來就會在完整句子處斷開，前一片的結尾與後一片的開頭不會咬在同一句中間，
+    重疊的原始用途（避免句子被切斷而失去語境）已由切分本身解決。
+
+    2026 年 1 月的 arXiv 分析亦指出 overlap 在多數情況下沒有可測效益、只是
+    墊高索引成本。若日後要恢復，應先在 golden set 上驗證，不要憑慣例加回來。
+    """
+    if not text:
+        return []
+    return _recursive_split(text, chunk_size, _SEPARATORS)
 
 class DailyQuotaExhausted(Exception):
     """今日 embedding 額度已用盡——重試無效，只能等隔天。
@@ -144,12 +215,22 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
             incoming_updated = article.get("updated_at")
             needs_rewrite = False
             old = collection.find_one(
-                {"url": url}, {"updated_at": 1, "total_chunks": 1}) if url else None
+                {"url": url},
+                {"updated_at": 1, "total_chunks": 1, "chunker_version": 1},
+            ) if url else None
             if old is not None:
                 declared = old.get("total_chunks")
                 actual = collection.count_documents({"url": url})
                 old_updated = old.get("updated_at")
-                if declared is not None and actual != declared:
+                old_chunker = old.get("chunker_version", 1)
+                if old_chunker != CHUNKER_VERSION:
+                    # (c) 切法換了。舊版是不看標點的字元硬切，切片從句子中間
+                    # 斷開，語意殘缺的片段直接進向量空間、也直接被下游拿去
+                    # 改寫理由。這個檢查讓既有資料逐步重切而不需要人工介入。
+                    print(f"  ✂️ 切法已更新（v{old_chunker} → v{CHUNKER_VERSION}），"
+                          f"將重切: {title[:15]}...")
+                    needs_rewrite = True
+                elif declared is not None and actual != declared:
                     # 破洞：舊版逐塊寫入時某塊向量化失敗只印警告、其餘照常寫入；
                     # 或寫入中途失敗留下前綴（insert_many 預設 ordered=True）。
                     # 這篇之後會被判定「已存在」而永遠跳過，破洞不會自己補上。
@@ -159,6 +240,12 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                           f"實際 {actual} 塊），將重寫修復: {title[:15]}...")
                     needs_rewrite = True
                 elif incoming_updated and old_updated is None:
+                    # 注意優先序：上面的切法版本檢查排在這一支之前，因此切法
+                    # 換版的那一輪，這個「只補日期不重算」的優化會被蓋過。那是
+                    # 刻意的——切片邊界錯了就沒有「不重算」的餘地，而優化本來
+                    # 就是為了避免「無意義」的重算。等全部重切完成之後，這一支
+                    # 才會恢復作用。
+                    #
                     # 這一篇是本次變更之前寫入的，沒有日期可比對。
                     # 完整的既有文章只補中繼資料、不重新向量化：把「沒有日期」
                     # 當成「日期不同」會讓合併後首次執行重算全部既有切片
@@ -240,6 +327,7 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                     "verdict": article.get("verdict"),
                     "verdict_slug": article.get("verdict_slug"),
                     "claim": article.get("claim"),
+                    "chunker_version": CHUNKER_VERSION,
                 }
                 for i, (chunk, vector) in enumerate(zip(chunks, vectors))
             ]

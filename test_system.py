@@ -4,6 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 from ca_bundle import get_ca_bundle
 from utils import clean_html
+from main_pipeline import CHUNKER_VERSION as _CURRENT_CHUNKER
 from scraper_api import get_api_articles, is_admin_notice
 from scraper_fda import get_fda_articles
 from scraper_tfc import get_tfc_articles
@@ -376,7 +377,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         collection = FakeCollection(existing=[
             {"url": "https://example.com/a", "original_title": "文章",
-             "updated_at": "2026-08-01"},
+             "updated_at": "2026-08-01", "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
             "title": "文章", "content": "內容。", "source": "來源",
@@ -472,7 +473,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection = FakeCollection([
             {"url": "https://example.tw/a", "original_title": "舊文",
              "chunk_content": "舊內容", "chunk_index": 1, "total_chunks": 1,
-             "embedding": [0.1]},
+             "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
             "source": "衛福部闢謠網站", "url": "https://example.tw/a",
@@ -508,7 +509,8 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection = FakeCollection([
             {"url": "https://tfc-taiwan.org.tw/fact-check-reports/x",
              "original_title": "舊查核報告", "chunk_content": "舊內容",
-             "chunk_index": 1, "total_chunks": 1, "embedding": [0.1]},
+             "chunk_index": 1, "total_chunks": 1, "embedding": [0.1],
+             "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
             "source": "台灣事實查核中心",
@@ -595,7 +597,8 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection = FakeCollection([
             {"url": "https://example.tw/e", "original_title": "有舊版的文章",
              "chunk_content": "舊內容", "chunk_index": 1, "total_chunks": 1,
-             "embedding": [0.1], "updated_at": "2024/01/01"},
+             "embedding": [0.1], "updated_at": "2024/01/01",
+             "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
             "source": "衛福部闢謠網站", "url": "https://example.tw/e",
@@ -656,10 +659,10 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection = FakeCollection([
             {"url": "https://example.tw/ok", "original_title": "完整文章",
              "chunk_content": "第一塊", "chunk_index": 1, "total_chunks": 2,
-             "embedding": [0.1]},
+             "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER},
             {"url": "https://example.tw/ok", "original_title": "完整文章",
              "chunk_content": "第二塊", "chunk_index": 2, "total_chunks": 2,
-             "embedding": [0.1]},
+             "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
             "source": "衛福部闢謠網站", "url": "https://example.tw/ok",
@@ -757,7 +760,8 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection = FakeCollection([
             {"url": "https://example.tw/later", "original_title": "後來破的文章",
              "chunk_content": "第一塊", "chunk_index": 1, "total_chunks": 4,
-             "embedding": [0.1], "updated_at": "2024/06/01"},
+             "embedding": [0.1], "updated_at": "2024/06/01",
+             "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
             "source": "衛福部闢謠網站", "url": "https://example.tw/later",
@@ -935,7 +939,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection = FakeCollection([
             {"url": "https://example.tw/renamed", "original_title": "舊標題",
              "chunk_content": "舊內容", "chunk_index": 1, "total_chunks": 1,
-             "embedding": [0.1]},
+             "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
             "source": "衛福部闢謠網站", "url": "https://example.tw/renamed",
@@ -1254,3 +1258,138 @@ class TestTFCClaimExtraction(unittest.TestCase):
     def test_no_claim_anywhere_returns_empty(self):
         from scraper_tfc import _extract_claim
         self.assertEqual(_extract_claim(self._soup("<p>無關內容</p>"), "沒有前綴"), "")
+
+
+class TestBoundaryAwareChunking(unittest.TestCase):
+    """切塊要在語意邊界上斷開，不要從句子中間切。
+
+    舊版是 `text[start:start+500]` 的硬切：線上 TFC 那批平均每篇 1,578 字、
+    切成 4 片，每一片都從句子中間斷開。語意殘缺的片段直接進向量空間，也直接
+    被下游拿去改寫理由。
+    """
+
+    def test_short_text_is_one_chunk(self):
+        from main_pipeline import chunk_text
+        self.assertEqual(chunk_text("很短的一句話。"), ["很短的一句話。"])
+
+    def test_empty_input_returns_empty_list(self):
+        from main_pipeline import chunk_text
+        self.assertEqual(chunk_text(""), [])
+        self.assertEqual(chunk_text(None), [])
+
+    def test_chunks_end_at_sentence_boundaries(self):
+        """這是本次變更的重點：切片不得從句子中間斷開。"""
+        from main_pipeline import chunk_text
+        text = "".join(f"這是第{i}句話，內容大約二十個字左右填充。" for i in range(1, 60))
+        chunks = chunk_text(text, chunk_size=200)
+        self.assertGreater(len(chunks), 1, "測資應該要被切成多片")
+        for chunk in chunks:
+            with self.subTest(chunk=chunk[-12:]):
+                self.assertTrue(chunk.rstrip().endswith(("。", "！", "？", "；", "，")),
+                                f"切片結尾不在標點上：{chunk[-16:]!r}")
+
+    def test_no_chunk_exceeds_size(self):
+        from main_pipeline import chunk_text
+        text = "".join(f"句子{i}。" for i in range(1, 400))
+        for chunk in chunk_text(text, chunk_size=300):
+            self.assertLessEqual(len(chunk), 300)
+
+    def test_paragraph_boundary_preferred_over_sentence(self):
+        """有段落分隔時應優先在段落切，而不是先切句子。"""
+        from main_pipeline import chunk_text
+        para = "第一段的句子。" * 12          # 約 84 字
+        text = para + "\n\n" + para
+        chunks = chunk_text(text, chunk_size=100)
+        self.assertTrue(any(c.rstrip().endswith("\n\n") or c.endswith("。")
+                            for c in chunks))
+        self.assertTrue(all("\n\n" not in c.strip() for c in chunks),
+                        "段落分隔不該留在切片中間")
+
+    def test_single_oversized_sentence_falls_back_to_hard_cut(self):
+        """單一句子就超過上限時仍要能切——硬切是最後一層，不是常態。"""
+        from main_pipeline import chunk_text
+        text = "字" * 700 + "。"
+        chunks = chunk_text(text, chunk_size=300)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 300)
+        self.assertEqual("".join(chunks), text, "硬切不得遺失字元")
+
+    def test_no_content_is_lost(self):
+        """切片接回來要等於原文——切塊不得遺失或重複內容。
+
+        舊版有 50 字 overlap 所以接不回原文；新版不再重疊，這條斷言因此成立，
+        也順便鎖住「重疊被悄悄加回來」這種回歸。
+        """
+        from main_pipeline import chunk_text
+        text = "".join(f"第{i}句內容在這裡。" for i in range(1, 120))
+        self.assertEqual("".join(chunk_text(text, chunk_size=250)), text)
+
+    def test_whitespace_only_pieces_are_dropped(self):
+        from main_pipeline import chunk_text
+        self.assertEqual(chunk_text("   \n\n   "), [])
+
+
+class TestChunkerVersioning(unittest.TestCase):
+    """切法改變時，既有文章要逐步重切——不需要人工全刪重灌。
+
+    ETL 以 url 判定「已存在」會直接跳過，沒有這個標記的話切法一改，舊資料就
+    永遠留在舊邊界上。
+    """
+
+    def test_old_chunker_version_triggers_rewrite(self):
+        from main_pipeline import upload_to_mongodb, CHUNKER_VERSION
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/a", "original_title": "舊文",
+             "chunk_content": "舊切法的殘句", "chunk_index": 1, "total_chunks": 1,
+             "embedding": [0.1], "updated_at": "2026-01-01",
+             "chunker_version": CHUNKER_VERSION - 1},
+        ])
+        article = {"source": "測試", "url": "https://example.tw/a", "title": "舊文",
+                   "content": "第一句。第二句。", "updated_at": "2026-01-01"}
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+
+        self.assertTrue(collection.deleted_filters, "應刪除舊切片後重寫")
+        self.assertTrue(collection.inserted_batches, "應寫入新切片")
+        self.assertTrue(
+            all(d["chunker_version"] == CHUNKER_VERSION
+                for d in collection.inserted_batches[0]),
+            "新切片要標上目前的切法版本")
+
+    def test_missing_chunker_version_is_treated_as_v1(self):
+        """本次變更之前寫入的文件沒有這個欄位，要被視為最舊的版本。"""
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/b", "original_title": "無版本欄位",
+             "chunk_content": "內容", "chunk_index": 1, "total_chunks": 1,
+             "embedding": [0.1], "updated_at": "2026-01-01"},
+        ])
+        article = {"source": "測試", "url": "https://example.tw/b",
+                   "title": "無版本欄位", "content": "第一句。第二句。",
+                   "updated_at": "2026-01-01"}
+
+        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        self.assertTrue(collection.inserted_batches, "缺欄位應視為 v1 而重切")
+
+    def test_same_chunker_version_does_not_rewrite(self):
+        """版本相同且無其他重寫理由時不得重算——那會浪費整批 embedding 額度。"""
+        from main_pipeline import upload_to_mongodb, CHUNKER_VERSION
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/c", "original_title": "現行版本",
+             "chunk_content": "內容", "chunk_index": 1, "total_chunks": 1,
+             "embedding": [0.1], "updated_at": "2026-01-01",
+             "chunker_version": CHUNKER_VERSION},
+        ])
+        article = {"source": "測試", "url": "https://example.tw/c",
+                   "title": "現行版本", "content": "第一句。第二句。",
+                   "updated_at": "2026-01-01"}
+
+        def must_not_embed(text):
+            raise AssertionError("版本相同不應重新向量化")
+
+        upload_to_mongodb([article], collection, embed_fn=must_not_embed)
+        self.assertEqual(collection.inserted_batches, [])
