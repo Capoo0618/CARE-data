@@ -53,6 +53,19 @@ def find_missing_sources(articles, expected=EXPECTED_SOURCES):
 #
 # 重切受每日 embedding 額度限制，會分多天完成；額度用盡時本次執行乾淨結束，
 # 隔天自然接續（見 DailyQuotaExhausted）。
+# 每次 embedding 呼叫前的間隔。
+#
+# 舊值 2.0 秒。當初設它是為了避開速率限制，但實際綁住我們的是**每天 1,000 次**
+# 的上限（見 DailyQuotaExhausted），與速率無關——2 秒的間隔讓跑滿當日額度就要
+# 33 分鐘，加上四個來源約 43 分鐘的爬蟲，2026-08-23 那次重切因此在還沒用完額度
+# （只用了 978 次）就撞到 workflow 的時間上限被砍。
+#
+# 0.7 秒 ≈ 86 RPM。Google 沒有公開列出 embedding 在免費方案的每分鐘上限，
+# 這是保守估計而非查證值——若估錯了，既有的重試路徑（40 秒 × 2 次）足以跨過
+# 一個分鐘視窗，而每日額度耗盡仍會走 DailyQuotaExhausted 乾淨結束。也就是說
+# 猜錯的代價是「偶爾多等 80 秒」，不是資料錯誤或整批失敗。
+EMBED_CALL_INTERVAL_SECONDS = 0.7
+
 CHUNKER_VERSION = 2
 
 _SEPARATORS = ("\n\n", "\n", "。", "！", "？", "；", "，")
@@ -140,7 +153,7 @@ def get_embedding(text: str, max_retries=3) -> list:
     
     for attempt in range(max_retries):
         try:
-            time.sleep(2) 
+            time.sleep(EMBED_CALL_INTERVAL_SECONDS)
             response = requests.post(url, json=payload, timeout=15)
             response_data = response.json()
             
