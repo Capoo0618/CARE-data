@@ -1393,3 +1393,49 @@ class TestChunkerVersioning(unittest.TestCase):
 
         upload_to_mongodb([article], collection, embed_fn=must_not_embed)
         self.assertEqual(collection.inserted_batches, [])
+
+
+class TestEmbedThrottle(unittest.TestCase):
+    """節流間隔要小到能在時間上限內跑滿當日額度。
+
+    綁住 ETL 的是每天 1,000 次的上限，不是速率。舊值 2 秒讓跑滿額度就要 33
+    分鐘，加上約 43 分鐘的爬蟲，2026-08-23 那次重切因此在還沒用完額度（只用了
+    978 次）就撞到 workflow 時間上限被砍。
+    """
+
+    def test_interval_allows_daily_quota_within_timeout(self):
+        from main_pipeline import EMBED_CALL_INTERVAL_SECONDS
+        DAILY_QUOTA = 1000
+        SCRAPE_MINUTES = 45      # 四個來源實測約 43 分鐘，取整數上界
+        TIMEOUT_MINUTES = 300
+
+        embed_minutes = DAILY_QUOTA * EMBED_CALL_INTERVAL_SECONDS / 60
+        self.assertLess(
+            SCRAPE_MINUTES + embed_minutes, TIMEOUT_MINUTES * 0.5,
+            "跑滿當日額度應在時間上限的一半以內，留足重切期間的餘裕")
+
+    def test_interval_stays_under_a_conservative_rpm_ceiling(self):
+        """不要為了快而把間隔壓到可能觸發每分鐘限制的程度。
+
+        Google 沒有公開列出 embedding 在免費方案的每分鐘上限，100 RPM 是常見值，
+        這裡以它為保守天花板。猜錯的代價由既有重試路徑吸收（40 秒 × 2 次足以
+        跨過一個分鐘視窗），但仍不該主動貼著天花板跑。
+        """
+        from main_pipeline import EMBED_CALL_INTERVAL_SECONDS
+        rpm = 60 / EMBED_CALL_INTERVAL_SECONDS
+        self.assertLess(rpm, 100, "間隔太小，可能主動觸發每分鐘限制")
+
+    def test_transient_rate_limit_backoff_spans_a_minute_window(self):
+        """重試的等待總和要足以跨過一個分鐘視窗。
+
+        這是節流猜錯時的安全網：若 0.7 秒確實觸發了每分鐘限制，重試必須等得夠久
+        才能恢復，否則會被誤判成每日額度耗盡而讓本次執行提早結束。
+        """
+        import inspect
+        import main_pipeline
+        source = inspect.getsource(main_pipeline.get_embedding)
+        self.assertIn("time.sleep(40)", source)
+        # max_retries=3 → 兩次 40 秒的等待，總和 80 秒 > 60 秒視窗
+        self.assertEqual(
+            inspect.signature(main_pipeline.get_embedding).parameters["max_retries"].default,
+            3)
