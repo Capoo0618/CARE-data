@@ -20,3 +20,6 @@ Thumbs.db
 
 # 5. Git worktrees（隔離工作區，不進版控）
 .worktrees/
+
+# 6. 資料庫備份（含 embedding，體積大，不進版控）
+backups/

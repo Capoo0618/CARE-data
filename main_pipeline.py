@@ -9,6 +9,7 @@ from pymongo import MongoClient
 # 匯入我們自己寫好的爬蟲模組
 from scraper_api import get_api_articles
 from scraper_fda import get_fda_articles
+from scraper_mohw import get_mohw_articles
 from scraper_tfc import get_tfc_articles
 
 # 載入環境變數
@@ -16,16 +17,40 @@ load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
 
-# 三個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
+# 四個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
 # 任一來源本次一篇都沒抓到，就是異常——見 find_missing_sources 的說明。
+#
+# 命名原則：**來源名必須與實際發布機關一致**。這個欄位不是內部識別碼，它會
+# 出現在 CARE 回覆的參考來源清單、每日醫療消息卡，以及分享給家人的卡片上——
+# 而分享卡上的來源名是收件人唯一能自行查證的東西。這裡已經踩過兩次：
+# 2026-08-16 的 DataAction 誤標，與 2026-09-09 的 hpa 誤標。
 EXPECTED_SOURCES = frozenset({
-    # 真正的闢謠專區（scraper_fda，有文章網址）
+    # 真正的闢謠專區（scraper_fda，有文章網址）。
+    # 注意：此來源實質停更（2024 年 23 篇 → 2025 年 3 篇 → 2026 年 1 篇，
+    # 2026-09-09 實測站上最新一篇為 2026-07-16）。仍列入是因為爬蟲每次執行
+    # 都會取回既有的 587 篇，"一篇都沒有" 仍然代表爬蟲或站台故障。
     "食藥署闢謠專區",
     # 食藥署全站新聞稿 feed（scraper_api，無網址）。2026-08-16 之前這批被
     # 誤標成「食藥署闢謠專區」，見 scraper_api.get_api_articles 的說明。
     "食藥署公告",
-    "衛福部闢謠網站",
+    # 國民健康署的新聞 feed（scraper_api）。2026-09-09 之前標成「衛福部闢謠
+    # 網站」，那是誤標：hpa.gov.tw 是國健署，衛福部本部是 mohw.gov.tw。
+    # 既有文件的改名見 migrations/2026_09_09_rename_hpa_source.py。
+    "國健署新聞",
     "台灣事實查核中心",
+    # 衛福部「真相說明」彙整頁（scraper_mohw）依連結指向的機關拆成三個來源，
+    # 因為 source_name 必須與實際發布機關一致——這一頁上的文章分別掛在
+    # mohw / hpa / cdc 三個站上，全部標成「衛福部」就是引用錯機關。
+    "衛福部真相說明",
+    "國健署真相與闢謠",
+    # 「疾管署闢謠專區」刻意**不**列入：那 24 筆全部是 110 年 COVID 時期的
+    # 舊文，站方已多年沒有新增。
+    #
+    # 訂正 design.md 的理由（2026-09-09）：該文件寫的是「日常增量不會有新的，
+    # 列入會每天誤報來源全滅」。那個理由假設爬蟲會跳過已知文章，但實作與
+    # scraper_fda 一致——每次執行都重抓全部明細，所以疾管署其實每輪都會產出
+    # 24 篇，列入並不會誤報。真正的理由是價值不相稱：24 篇四年前的疫情舊文
+    # 抓不到時，不值得讓整條 ETL 以非零狀態碼結束。
 })
 
 
@@ -418,6 +443,7 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
             lambda: get_api_articles(test_mode=False),
             lambda: get_fda_articles(test_mode=False),
             lambda: get_tfc_articles(test_mode=False),
+            lambda: get_mohw_articles(test_mode=False),
         )
     collection_factory = collection_factory or _default_collection
 

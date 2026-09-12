@@ -40,9 +40,22 @@ def get_api_articles(test_mode=False):
     已知限制：這個端點結構上就不提供文章網址，因此本來源的 url 恆為 None，
     答案中無法附上可點的連結。闢謠專區沒有這個問題。
     """
+    # 國健署那筆在 2026-09-09 之前標成「衛福部闢謠網站」，那是誤標：
+    # hpa.gov.tw 是國民健康署，衛福部本部是 mohw.gov.tw。與 DataAction 的
+    # 誤標同一類錯誤。既有文件的改名見
+    # migrations/2026_09_09_rename_hpa_source.py。
+    #
+    # 已知限制（2026-09-09 實測）：newsapi.ashx **硬性只回最近 1000 筆**，
+    # 且不接受任何分頁參數（top / rows / count / pageSize / page / pn 六個
+    # 都試過，一律回同樣的 1000 筆、最舊都停在 2021-08-16）。它是滾動窗口，
+    # 不是全量——每進一篇新的就掉一篇舊的。目前 DB 裡有 1,013 篇，多出來的
+    # 13 篇已經滑出窗口、只存在資料庫裡。
+    #
+    # 這代表 **這批資料無法從來源完整重建**：知識庫若重灌，只救得回當時窗口
+    # 內的 1000 筆。備份不是選配，見 scripts/backup_knowledge_base.sh。
     api_sources = [
         {"url": "https://www.fda.gov.tw/DataAction", "name": "食藥署公告"},
-        {"url": "https://www.hpa.gov.tw/wf/newsapi.ashx", "name": "衛福部闢謠網站"}
+        {"url": "https://www.hpa.gov.tw/wf/newsapi.ashx", "name": "國健署新聞"}
     ]
     
     headers = {
@@ -77,7 +90,7 @@ def get_api_articles(test_mode=False):
                 if not raw_title or not raw_content: continue
 
                 # 行政公告不進知識庫（見 ADMIN_NOISE_KEYWORDS）。只套用在
-                # 食藥署那個 feed——衛福部闢謠網站本來就沒有這類內容。
+                # 食藥署那個 feed——國健署新聞本來就沒有這類內容。
                 if source["name"] == "食藥署公告" and is_admin_notice(raw_title):
                     continue
 

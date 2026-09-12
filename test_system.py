@@ -8,6 +8,8 @@ from main_pipeline import CHUNKER_VERSION as _CURRENT_CHUNKER
 from scraper_api import get_api_articles, is_admin_notice
 from scraper_fda import get_fda_articles
 from scraper_tfc import get_tfc_articles
+import scraper_mohw
+import main_pipeline
 
 
 class FakeCollection:
@@ -120,7 +122,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         articles = get_api_articles(test_mode=True)
 
         # 3. 找出模組抓到的「衛福部」第一篇文章
-        hpa_first_article = next(art for art in articles if art["source"] == "衛福部闢謠網站")
+        hpa_first_article = next(art for art in articles if art["source"] == "國健署新聞")
 
         # 4. 斷言比對 (Data Integrity Check)
         print(f"\n    🔍 [API 來源原始資料] 最新標題: {expected_title}")
@@ -450,8 +452,8 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertEqual(find_missing_sources(full), set(),
                          "三個來源都有產出時不應回報缺漏")
 
-        without_hpa = [a for a in full if a["source"] != "衛福部闢謠網站"]
-        self.assertEqual(find_missing_sources(without_hpa), {"衛福部闢謠網站"},
+        without_hpa = [a for a in full if a["source"] != "國健署新聞"]
+        self.assertEqual(find_missing_sources(without_hpa), {"國健署新聞"},
                          "衛福部全滅時必須被指名")
 
         self.assertEqual(find_missing_sources([]), set(EXPECTED_SOURCES),
@@ -476,7 +478,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/a",
+            "source": "國健署新聞", "url": "https://example.tw/a",
             "title": "舊文", "content": "新內容",
             "published_at": "2024/01/01", "updated_at": "2024/03/15",
         }
@@ -551,9 +553,9 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection.insert_many = failing_first_insert
 
         articles = [
-            {"source": "衛福部闢謠網站", "url": "https://example.tw/bad",
+            {"source": "國健署新聞", "url": "https://example.tw/bad",
              "title": "會失敗的文章", "content": "內容", "updated_at": None},
-            {"source": "衛福部闢謠網站", "url": "https://example.tw/ok",
+            {"source": "國健署新聞", "url": "https://example.tw/ok",
              "title": "後面的文章", "content": "內容", "updated_at": None},
         ]
 
@@ -601,7 +603,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/e",
+            "source": "國健署新聞", "url": "https://example.tw/e",
             "title": "有舊版的文章", "content": "", "updated_at": "2024/09/09",
         }
 
@@ -629,7 +631,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "embedding": [0.1]},
         ])
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/hole",
+            "source": "國健署新聞", "url": "https://example.tw/hole",
             "title": "破洞文章", "content": "完整的新內容",
             "published_at": "2024/01/01", "updated_at": "2024/03/15",
         }
@@ -665,7 +667,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/ok",
+            "source": "國健署新聞", "url": "https://example.tw/ok",
             "title": "完整文章", "content": "新內容",
             "published_at": "2024/01/01", "updated_at": "2024/03/15",
         }
@@ -698,7 +700,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "chunk_index": 1, "total_chunks": 3},
         ])
         article = {
-            "title": "破洞文章", "content": "第一句。" * 200, "source": "衛福部闢謠網站",
+            "title": "破洞文章", "content": "第一句。" * 200, "source": "國健署新聞",
             "url": "https://example.com/hole-fail",
             "published_at": "2025-12-01", "updated_at": "2026-08-01",
         }
@@ -732,7 +734,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         collection = PrefixInsertCollection([])
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/partial",
+            "source": "國健署新聞", "url": "https://example.tw/partial",
             "title": "會寫到一半的文章", "content": "內容" * 600,
             "updated_at": None,
         }
@@ -764,7 +766,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/later",
+            "source": "國健署新聞", "url": "https://example.tw/later",
             "title": "後來破的文章", "content": "重新取得的完整內容",
             "updated_at": "2024/06/01",
         }
@@ -787,7 +789,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         collection = FakeCollection([])
         articles = [
-            {"source": "衛福部闢謠網站", "url": f"https://example.tw/{i}",
+            {"source": "國健署新聞", "url": f"https://example.tw/{i}",
              "title": f"文章{i}", "content": "內容", "updated_at": None}
             for i in range(3)
         ]
@@ -809,9 +811,9 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         collection = FakeCollection([])
         articles = [
-            {"source": "衛福部闢謠網站", "url": "https://example.tw/a",
+            {"source": "國健署新聞", "url": "https://example.tw/a",
              "title": "會失敗的文章", "content": "內容", "updated_at": None},
-            {"source": "衛福部闢謠網站", "url": "https://example.tw/b",
+            {"source": "國健署新聞", "url": "https://example.tw/b",
              "title": "會成功的文章", "content": "內容", "updated_at": None},
         ]
 
@@ -860,7 +862,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         collection = FakeCollection([])
         content = "衛教內容" * 200          # 800 字，確定會切成多塊
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/shape",
+            "source": "國健署新聞", "url": "https://example.tw/shape",
             "title": "欄位形狀測試", "content": content,
             "published_at": "2024/01/01", "updated_at": "2024/03/15",
         }
@@ -873,7 +875,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         for i, (doc, expected_chunk) in enumerate(
                 zip(collection.docs, expected_chunks)):
-            self.assertEqual(doc["source_name"], "衛福部闢謠網站")
+            self.assertEqual(doc["source_name"], "國健署新聞")
             self.assertEqual(doc["url"], "https://example.tw/shape")
             self.assertEqual(doc["original_title"], "欄位形狀測試")
             self.assertEqual(doc["chunk_content"], expected_chunk,
@@ -900,7 +902,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         from main_pipeline import upload_to_mongodb
 
         collection = FakeCollection([])
-        base = {"source": "衛福部闢謠網站", "url": "https://example.tw/same",
+        base = {"source": "國健署新聞", "url": "https://example.tw/same",
                 "content": "內容", "updated_at": None}
         articles = [dict(base, title="標題甲"), dict(base, title="標題乙")]
 
@@ -942,7 +944,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER},
         ])
         article = {
-            "source": "衛福部闢謠網站", "url": "https://example.tw/renamed",
+            "source": "國健署新聞", "url": "https://example.tw/renamed",
             "title": "改過的新標題", "content": "內容", "updated_at": None,
         }
 
@@ -965,10 +967,16 @@ class TestHealthETLPipeline(unittest.TestCase):
              "title": "闢謠專區文章", "content": "內容", "updated_at": None},
             {"source": "食藥署公告", "url": None, "title": "食藥署公告文章",
              "content": "內容", "updated_at": None},
-            {"source": "衛福部闢謠網站", "url": "https://example.tw/hpa",
-             "title": "衛福部文章", "content": "內容", "updated_at": None},
+            {"source": "國健署新聞", "url": "https://example.tw/hpa",
+             "title": "國健署新聞文章", "content": "內容", "updated_at": None},
             {"source": "台灣事實查核中心", "url": "https://example.tw/tfc",
              "title": "查核中心文章", "content": "內容", "updated_at": None},
+            {"source": "衛福部真相說明", "url": "https://example.tw/mohw",
+             "title": "真相說明文章", "content": "內容", "updated_at": None},
+            {"source": "國健署真相與闢謠", "url": "https://example.tw/hpa-truth",
+             "title": "真相與闢謠文章", "content": "內容", "updated_at": None},
+            # 「疾管署闢謠專區」刻意不在這裡：它不在 EXPECTED_SOURCES 內，
+            # 加進來不會影響退出碼，但會讓這份 fixture 與那份集合失去對應。
         ]
 
     def test_29_job_returns_zero_when_everything_succeeds(self):
@@ -1439,3 +1447,101 @@ class TestEmbedThrottle(unittest.TestCase):
         self.assertEqual(
             inspect.signature(main_pipeline.get_embedding).parameters["max_retries"].default,
             3)
+
+
+class TestMohwTruthClarification(unittest.TestCase):
+    """衛福部「真相說明」爬蟲。
+
+    這一頁是跨機關的彙整頁，所以測試的重點不是「解析一種版面」，而是
+    **分派是否正確、以及該排除的有沒有真的被排除**。靜默多收一個網域會產生
+    重複文件（fda 那 199 筆），靜默少收一個網域會讓 14 篇文章消失而沒人知道
+    （nhi 那批就是這樣差點被漏掉——原始設計的網域表根本沒列到它）。
+    """
+
+    def test_roc_year_is_converted_to_gregorian(self):
+        """民國轉西元。三位數（含）以下才視為民國年。"""
+        self.assertEqual(scraper_mohw.roc_to_gregorian("115-09-01"), "2026-09-01")
+        self.assertEqual(scraper_mohw.roc_to_gregorian("102-07-01"), "2013-07-01")
+        self.assertEqual(scraper_mohw.roc_to_gregorian("110-06-13"), "2021-06-13")
+
+    def test_gregorian_year_is_left_alone(self):
+        """已經是西元的原樣回傳——四位數年份不可能是民國年。"""
+        self.assertEqual(scraper_mohw.roc_to_gregorian("2026-09-01"), "2026-09-01")
+
+    def test_unparseable_date_returns_none_not_a_guess(self):
+        """抽不到日期時回 None，不猜。
+
+        `published_at` 是 Tier 2 選材排序與 Tier 1 時效門檻的依據，塞一個猜
+        出來的日期進去，錯誤會安靜地傳到推播端。
+        """
+        for bad in ("", None, "abc", "115-09", "115/09/01"):
+            self.assertIsNone(scraper_mohw.roc_to_gregorian(bad), f"{bad!r} 應該回 None")
+
+    def test_fda_and_nhi_are_excluded_by_domain(self):
+        """食藥署與健保署在分派表上是明確排除，不是未知網域。
+
+        兩者的排除理由不同，但都必須是**有意識的決定**：fda 是因為 url 形式
+        不同會讓 ETL 的去重失效（`http://` + 小寫 `/tc/` + utm 參數），
+        nhi 是因為站台回 403。
+        """
+        self.assertIn("www.fda.gov.tw", scraper_mohw._EXCLUDED)
+        self.assertIn("www.nhi.gov.tw", scraper_mohw._EXCLUDED)
+        self.assertNotIn("www.fda.gov.tw", scraper_mohw._DISPATCH)
+        self.assertNotIn("www.nhi.gov.tw", scraper_mohw._DISPATCH)
+
+    def test_dispatch_covers_exactly_the_three_parsed_domains(self):
+        """分派表釘住三個來源名。
+
+        來源名必須與實際發布機關一致——這一頁上的文章分別掛在三個站上，全部
+        標成「衛福部」就是引用錯機關，而使用者點進連結會看到別的網域。
+        """
+        self.assertEqual(
+            {host: name for host, (name, _, _) in scraper_mohw._DISPATCH.items()},
+            {
+                "www.mohw.gov.tw": "衛福部真相說明",
+                "www.hpa.gov.tw": "國健署真相與闢謠",
+                "www.cdc.gov.tw": "疾管署闢謠專區",
+            },
+        )
+
+    def test_cdc_is_not_in_expected_sources(self):
+        """疾管署刻意不列入 EXPECTED_SOURCES，另外兩個要列入。
+
+        24 篇四年前的疫情舊文抓不到時，不值得讓整條 ETL 以非零狀態碼結束。
+        """
+        self.assertIn("衛福部真相說明", main_pipeline.EXPECTED_SOURCES)
+        self.assertIn("國健署真相與闢謠", main_pipeline.EXPECTED_SOURCES)
+        self.assertNotIn("疾管署闢謠專區", main_pipeline.EXPECTED_SOURCES)
+
+    def test_page_limit_is_not_hardcoded_to_the_measured_value(self):
+        """翻頁上限不得寫死 54——那是 2026-09-09 的實測值，站方增刪就會變。"""
+        import inspect
+        params = inspect.signature(scraper_mohw.get_mohw_articles).parameters
+        self.assertGreater(params["max_pages"].default, 54)
+
+    def test_list_page_yields_title_date_and_link(self):
+        """對真實列表頁驗證選擇器仍有效（動態一致性驗證）。
+
+        比照 `test_02b_fda_data_integrity` 的做法：站方改版時，這支測試是唯一
+        會讓我們知道的訊號。
+        """
+        rows = scraper_mohw._list_rows(1)
+        self.assertEqual(len(rows), 20, "真相說明列表頁每頁應有 20 筆")
+        for url, title, published_at in rows:
+            self.assertTrue(url.startswith("http"), f"{url!r} 不是網址")
+            self.assertTrue(title.strip(), f"{url} 沒有標題")
+            self.assertRegex(published_at, r"^\d{4}-\d{2}-\d{2}$",
+                             f"{url} 的日期沒有轉成西元：{published_at!r}")
+
+    def test_scraper_produces_only_dispatched_sources(self):
+        """冒煙測試：實跑第一頁，產出的來源名必須都在分派表裡。"""
+        articles = scraper_mohw.get_mohw_articles(test_mode=True)
+        self.assertTrue(articles, "真相說明一篇都沒抓到")
+        allowed = {name for name, _, _ in scraper_mohw._DISPATCH.values()}
+        for art in articles:
+            self.assertIn(art["source"], allowed)
+            self.assertTrue(art["url"], f"《{art['title']}》沒有 url")
+            self.assertTrue(art["content"].strip(), f"《{art['title']}》內容是空的")
+            self.assertRegex(art["published_at"], r"^\d{4}-\d{2}-\d{2}$")
+            self.assertNotIn("fda.gov.tw", art["url"])
+            self.assertNotIn("nhi.gov.tw", art["url"])
