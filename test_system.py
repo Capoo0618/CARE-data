@@ -9,6 +9,7 @@ from scraper_api import get_api_articles, is_admin_notice
 from scraper_fda import get_fda_articles
 from scraper_tfc import get_tfc_articles
 import scraper_mohw
+import scraper_media
 import main_pipeline
 
 
@@ -1055,12 +1056,38 @@ class TestHealthETLPipeline(unittest.TestCase):
         """
         from main_pipeline import main
 
+        ok = lambda: 0  # noqa: E731 —— 媒體 job 的替身，這支只測官方那條
         self.assertEqual(
-            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 1), 1,
+            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 1, media_job_fn=ok), 1,
             "job() 回傳 1 時 CI 模式必須也回傳 1")
         self.assertEqual(
-            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 0), 0,
+            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 0, media_job_fn=ok), 0,
             "成功時不得誤報失敗")
+
+    def test_33a_media_failure_turns_ci_red_but_official_still_runs(self):
+        """媒體失敗要讓 Actions 紅燈，但官方 ETL 仍照常執行（反之亦然）。
+
+        兩支都要跑完才決定退出碼。若任一支失敗就提早結束，一個來源的暫時
+        問題會讓另一個來源當天沒更新——那正是 job() 刻意避免的事。
+        """
+        from main_pipeline import main
+        calls = []
+
+        def official():
+            calls.append("official"); return 0
+
+        def media():
+            calls.append("media"); return 1
+
+        self.assertEqual(main(env={"GITHUB_ACTIONS": "true"},
+                              job_fn=official, media_job_fn=media), 1)
+        self.assertEqual(calls, ["official", "media"])
+
+        calls.clear()
+        self.assertEqual(main(env={"GITHUB_ACTIONS": "true"},
+                              job_fn=lambda: (calls.append("official"), 1)[1],
+                              media_job_fn=lambda: (calls.append("media"), 0)[1]), 1)
+        self.assertEqual(calls, ["official", "media"], "官方失敗時媒體仍必須執行")
 
 
 if __name__ == '__main__':
@@ -1545,3 +1572,98 @@ class TestMohwTruthClarification(unittest.TestCase):
             self.assertRegex(art["published_at"], r"^\d{4}-\d{2}-\d{2}$")
             self.assertNotIn("fda.gov.tw", art["url"])
             self.assertNotIn("nhi.gov.tw", art["url"])
+
+
+class TestHealthMedia(unittest.TestCase):
+    """健康媒體（元氣網）ETL。
+
+    重點不是解析一種 XML，而是兩個邊界：寫進**另一個** collection（RAG 檢索
+    沒有依來源過濾，寫錯地方就會變成闢謠引用來源），以及一篇都沒抓到時要紅燈。
+    """
+
+    SITEMAP = """<urlset><url><!-- cate：焦點 | sub：用藥停看聽 -->
+<loc>https://health.udn.com/health/story/6012/9751804</loc>
+<news:news><news:publication><news:name>udn 元氣網</news:name></news:publication>
+<news:publication_date>2026-09-13T16:51:16+08:00</news:publication_date>
+<news:title><![CDATA[吃止痛藥後血壓升高又多吃降壓藥？]]></news:title></news:news></url>
+<url><loc>https://health.udn.com/health/story/5999/1</loc>
+<news:news><news:publication_date>2026-09-13T08:00:00+08:00</news:publication_date>
+<news:title><![CDATA[沒有分類註解的條目]]></news:title></news:news></url>
+<url><loc>https://health.udn.com/health/story/5999/2</loc>
+<news:news><news:title><![CDATA[沒有發布時間的條目]]></news:title></news:news></url></urlset>"""
+
+    def test_parses_title_date_category_and_channel(self):
+        entries = scraper_media.parse_gnews_entries(self.SITEMAP)
+        first = entries[0]
+        self.assertEqual(first["title"], "吃止痛藥後血壓升高又多吃降壓藥？")
+        self.assertEqual(first["published_at"], "2026-09-13")
+        self.assertEqual(first["category"], "焦點")
+        self.assertEqual(first["subcategory"], "用藥停看聽")
+        self.assertEqual(first["channel"], "6012")
+        self.assertEqual(first["source_name"], "udn 元氣網")
+
+    def test_published_at_is_the_taipei_date(self):
+        """站方給的是 +08:00，日期部分就是台北日期，不得轉 UTC。
+
+        轉成 UTC 會讓台北清晨 0～8 點發布的文章掉到前一天，推播端「今天或昨天」
+        的時效判斷就會錯一天。
+        """
+        xml = self.SITEMAP.replace("2026-09-13T16:51:16", "2026-09-14T06:30:00")
+        self.assertEqual(scraper_media.parse_gnews_entries(xml)[0]["published_at"], "2026-09-14")
+
+    def test_missing_category_is_kept_as_none(self):
+        """沒有分類註解的條目照樣存，分類為 None——要不要推由 CARE 端決定。"""
+        entries = scraper_media.parse_gnews_entries(self.SITEMAP)
+        self.assertIsNone(entries[1]["category"])
+
+    def test_entry_without_date_is_dropped(self):
+        """沒有發布時間的條目不存：推播端的時效判斷完全依賴這個欄位。"""
+        titles = [e["title"] for e in scraper_media.parse_gnews_entries(self.SITEMAP)]
+        self.assertNotIn("沒有發布時間的條目", titles)
+
+    def test_media_goes_to_its_own_collection(self):
+        """寫進 daily_health_news，絕不是 health_articles_chunks。"""
+        self.assertEqual(scraper_media.COLLECTION_NAME, "daily_health_news")
+        self.assertNotEqual(scraper_media.COLLECTION_NAME, "health_articles_chunks")
+
+    def test_empty_fetch_is_a_failure(self):
+        """48 小時窗裡一篇都沒有，幾乎只可能是站方改版或網路／憑證問題。"""
+        rc = scraper_media.media_job(fetch=lambda: [], collection_factory=lambda: None)
+        self.assertEqual(rc, 1)
+
+    def test_upsert_is_idempotent(self):
+        """sitemap 是 48 小時窗，同一篇會連兩天出現；第二次只更新、不新增。"""
+        coll = _FakeUpsertCollection()
+        article = scraper_media.parse_gnews_entries(self.SITEMAP)[0]
+        self.assertEqual(scraper_media.upsert_media_articles([article], coll), 1)
+        self.assertEqual(scraper_media.upsert_media_articles([article], coll), 0)
+        self.assertEqual(len(coll.docs), 1)
+
+    def test_successful_job_returns_zero(self):
+        coll = _FakeUpsertCollection()
+        entries = scraper_media.parse_gnews_entries(self.SITEMAP)
+        rc = scraper_media.media_job(fetch=lambda: entries, collection_factory=lambda: coll)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(coll.docs), len(entries))
+
+
+class _FakeUpsertCollection:
+    """只實作 upsert_media_articles 用到的兩個方法。"""
+
+    def __init__(self):
+        self.docs = {}
+
+    def create_index(self, *args, **kwargs):
+        return None
+
+    def update_one(self, query, update, upsert=False):
+        url = query["url"]
+        is_new = url not in self.docs
+        doc = self.docs.setdefault(url, {})
+        doc.update(update["$set"])
+        if is_new:
+            doc.update(update.get("$setOnInsert", {}))
+
+        class _Result:
+            upserted_id = url if is_new else None
+        return _Result()

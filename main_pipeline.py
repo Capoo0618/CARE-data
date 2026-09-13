@@ -10,6 +10,7 @@ from pymongo import MongoClient
 from scraper_api import get_api_articles
 from scraper_fda import get_fda_articles
 from scraper_mohw import get_mohw_articles
+from scraper_media import COLLECTION_NAME as MEDIA_COLLECTION_NAME, media_job
 from scraper_tfc import get_tfc_articles
 
 # 載入環境變數
@@ -431,6 +432,16 @@ def _default_collection():
     return client["CARE_database"]["health_articles_chunks"]
 
 
+def _default_media_collection():
+    """健康媒體的 collection。刻意不是 health_articles_chunks，理由見 scraper_media。"""
+    client = MongoClient(MONGO_URI)
+    return client["CARE_database"][MEDIA_COLLECTION_NAME]
+
+
+def run_media_job():
+    return media_job(collection_factory=_default_media_collection)
+
+
 def job(*, fetchers=None, collection_factory=None, embed_fn=None):
     """執行一次完整 ETL。回傳 0 表示正常，1 表示有來源全滅或寫入失敗。
 
@@ -485,7 +496,7 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
 
     return exit_code
 
-def main(env=None, *, job_fn=None):
+def main(env=None, *, job_fn=None, media_job_fn=None):
     """環境偵測與退出碼決策。回傳要交給作業系統的退出碼。
 
     GitHub Actions 會自帶 `GITHUB_ACTIONS=true`。在該模式下這是一次性執行，
@@ -498,15 +509,26 @@ def main(env=None, *, job_fn=None):
     """
     env = os.environ if env is None else env
     job_fn = job_fn or job
+    media_job_fn = media_job_fn or run_media_job
 
     if env.get("GITHUB_ACTIONS") == "true":
         print("☁️ 偵測到雲端 GitHub Actions 環境，啟動單次排程任務...")
-        return job_fn()          # 非零退出碼讓 Actions 顯示紅燈
+        # 兩支都要跑完才決定退出碼：官方 ETL 失敗不該讓媒體當天沒更新，反之
+        # 亦然（資料面 fail-open）；但任一支失敗都要讓 Actions 顯示紅燈（訊號面
+        # fail-loud）。與 job() 內「來源缺漏仍照常寫入其餘來源」同一個判斷。
+        #
+        # 媒體排在官方之後、同一次執行：cron 是 UTC 00:00＝台北 08:00，每日推播
+        # 在台北 09:00（MEDICAL_NEWS_PUSH_TIME），不另開排程就趕得上。
+        official_rc = job_fn()
+        media_rc = media_job_fn()
+        return 1 if (official_rc or media_rc) else 0
 
     print("💻 偵測到本地開發環境，啟動常駐排程系統...")
     print("每天早上 08:00 將自動執行爬蟲任務。")
     job_fn()                     # 常駐模式不因單次失敗結束程序
+    media_job_fn()
     schedule.every().day.at("08:00").do(job_fn)
+    schedule.every().day.at("08:00").do(media_job_fn)
     while True:
         schedule.run_pending()
         time.sleep(60)
