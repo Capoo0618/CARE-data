@@ -128,6 +128,36 @@ def _get(url, timeout=25):
     return resp
 
 
+# 重試的等待秒數：第 1、2 次失敗後各等多久。共 3 次嘗試。
+_RETRY_BACKOFFS = (2, 5)
+
+
+def with_retries(fn, *, attempts=3, backoffs=_RETRY_BACKOFFS, sleep=time.sleep):
+    """呼叫 fn，遇到暫時性失敗就退避重試。純函式（sleep 可注入），可直接測。
+
+    為什麼需要：2026-09-13 GitHub Actions 那次，`mohw.gov.tw` 在第 5 頁列表直接
+    斷線（`RemoteDisconnected`），同一輪另有 4 篇明細也是同樣的錯誤，其餘 67 篇
+    正常——是間歇性的，不是整個被擋。當時沒有重試，一次斷線就讓那一輪只進 67 篇
+    （本機實測可分派約 810 篇）。
+
+    只重試「換個時間再來可能會好」的失敗：連線錯誤、逾時、429 與 5xx。其餘 4xx
+    （包括 404）不重試——重打同一個 404 只是多等十幾秒，而且 404 本來就不代表
+    下架（見模組 docstring）。
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == attempts - 1:
+                raise
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            retryable = status is not None and (status == 429 or status >= 500)
+            if not retryable or attempt == attempts - 1:
+                raise
+        sleep(backoffs[min(attempt, len(backoffs) - 1)])
+
+
 def _host(url):
     match = re.match(r"https?://([^/]+)", url or "")
     return match.group(1).lower() if match else ""
@@ -135,7 +165,8 @@ def _host(url):
 
 def _list_rows(page):
     """回傳某一頁列表的 (url, title, published_at) 三元組，保持頁面順序。"""
-    soup = BeautifulSoup(_get(LIST_URL_TEMPLATE.format(page=page)).content, "html.parser")
+    url = LIST_URL_TEMPLATE.format(page=page)
+    soup = BeautifulSoup(with_retries(lambda: _get(url)).content, "html.parser")
     rows = []
     for item in soup.select(".list li"):
         anchor = item.find("a", href=True)
@@ -177,7 +208,7 @@ def _parse_detail(url):
     """抓單篇明細頁。解析不出標題或內文就回 None（由呼叫端計數）。"""
     host = _host(url)
     source_name, title_selector, body_selector = _DISPATCH[host]
-    soup = BeautifulSoup(_get(url).content, "html.parser")
+    soup = BeautifulSoup(with_retries(lambda: _get(url)).content, "html.parser")
     for tag in soup(["script", "style"]):
         tag.decompose()
 
@@ -195,26 +226,43 @@ def _parse_detail(url):
     return {"title": title, "content": content, "source": source_name}
 
 
-def get_mohw_articles(test_mode=False, max_pages=200, sleep_seconds=0.4):
+# 連續幾頁列表在重試後仍失敗，就判定站台這一輪不可用、停止翻頁。
+_MAX_CONSECUTIVE_LIST_FAILURES = 3
+
+
+def get_mohw_articles(test_mode=False, max_pages=200, sleep_seconds=0.4, *,
+                      list_rows=None, parse_detail=None, sleep=time.sleep):
     """爬真相說明彙整頁，回傳與其他 scraper 相同格式的 dict list。
 
     :param test_mode: True 時只抓第一頁的前 3 篇。
     :param max_pages: 翻頁上限（防呆）。**不寫死 54**——那是 2026-09-09 的實測
         值，站方增刪內容時會變。正常會在連續兩頁沒有新連結時自己停。
+    :param list_rows / parse_detail / sleep: 測試用的注入點，預設為正式的
+        網路抓取與 time.sleep。
     """
+    list_rows = list_rows or _list_rows
+    parse_detail = parse_detail or _parse_detail
     print(f"\n[真相說明] 開始爬取列表: {LIST_URL_TEMPLATE.format(page=1)}")
 
     # 先蒐集全部列再抓內文，這樣「翻頁到底」的判斷不會跟內文失敗混在一起。
     # test_mode 只翻第一頁：否則「抓前 3 篇」還是要先跑完 54 頁的列表，
     # 冒煙測試就得等半分鐘。
     page_limit = 1 if test_mode else max_pages
-    rows, seen_urls, empty_streak = [], set(), 0
+    rows, seen_urls, empty_streak, failure_streak = [], set(), 0, 0
     for page in range(1, page_limit + 1):
         try:
-            page_rows = _list_rows(page)
+            page_rows = list_rows(page)
         except Exception as exc:
-            print(f"  第 {page} 頁列表抓取失敗: {exc}")
-            break
+            # 重試後仍失敗：跳過這一頁、繼續翻，**不整批中止**。以前這裡是
+            # break，一次斷線就丟掉後面所有頁。連續失敗才判定站台這輪不可用——
+            # 否則站台整個掛掉時，會對剩下的上百頁每頁各重試一輪。
+            failure_streak += 1
+            print(f"  第 {page} 頁列表重試後仍失敗，跳過（連續第 {failure_streak} 頁）: {exc}")
+            if failure_streak >= _MAX_CONSECUTIVE_LIST_FAILURES:
+                print("  連續多頁失敗，判定站台這一輪不可用，停止翻頁。")
+                break
+            continue
+        failure_streak = 0
 
         new_rows = [r for r in page_rows if r[0] not in seen_urls]
         for row in new_rows:
@@ -231,7 +279,7 @@ def get_mohw_articles(test_mode=False, max_pages=200, sleep_seconds=0.4):
                 break
         else:
             empty_streak = 0
-        time.sleep(sleep_seconds)
+        sleep(sleep_seconds)
 
     print(f"  列表共 {len(rows)} 筆，開始分派")
 
@@ -242,7 +290,7 @@ def get_mohw_articles(test_mode=False, max_pages=200, sleep_seconds=0.4):
             skipped[host] = skipped.get(host, 0) + 1
             continue
         try:
-            detail = _parse_detail(url)
+            detail = parse_detail(url)
         except Exception as exc:
             failed += 1
             print(f"  ⚠️ 明細抓取失敗，本次跳過（不視為下架）: {url} —— {exc}")
@@ -266,7 +314,7 @@ def get_mohw_articles(test_mode=False, max_pages=200, sleep_seconds=0.4):
         })
         if test_mode and len(articles) >= 3:
             break
-        time.sleep(sleep_seconds)
+        sleep(sleep_seconds)
 
     for host, count in sorted(skipped.items(), key=lambda kv: -kv[1]):
         reason = _EXCLUDED.get(host)

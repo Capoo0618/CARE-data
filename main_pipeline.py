@@ -517,18 +517,22 @@ def main(env=None, *, job_fn=None, media_job_fn=None):
         # 亦然（資料面 fail-open）；但任一支失敗都要讓 Actions 顯示紅燈（訊號面
         # fail-loud）。與 job() 內「來源缺漏仍照常寫入其餘來源」同一個判斷。
         #
-        # 媒體排在官方之後、同一次執行：cron 是 UTC 00:00＝台北 08:00，每日推播
-        # 在台北 09:00（MEDICAL_NEWS_PUSH_TIME），不另開排程就趕得上。
-        official_rc = job_fn()
+        # 媒體先跑：它只要十幾秒，官方要約一小時。每日推播在台北 09:00
+        # （MEDICAL_NEWS_PUSH_TIME），媒體先寫入就不必排在官方後面等。
+        #
+        # 排程時間見 .github/workflows/etl_pipeline.yml：GitHub 的 cron 實測會延遲
+        # 約 2.5 小時觸發，原本 UTC 00:00（台北 08:00）的設定實際在台北 10:30
+        # 才開跑，當天抓的東西趕不上當天的推播。
         media_rc = media_job_fn()
+        official_rc = job_fn()
         return 1 if (official_rc or media_rc) else 0
 
     print("💻 偵測到本地開發環境，啟動常駐排程系統...")
     print("每天早上 08:00 將自動執行爬蟲任務。")
-    job_fn()                     # 常駐模式不因單次失敗結束程序
-    media_job_fn()
-    schedule.every().day.at("08:00").do(job_fn)
+    media_job_fn()               # 常駐模式不因單次失敗結束程序
+    job_fn()
     schedule.every().day.at("08:00").do(media_job_fn)
+    schedule.every().day.at("08:00").do(job_fn)
     while True:
         schedule.run_pending()
         time.sleep(60)

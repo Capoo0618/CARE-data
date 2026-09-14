@@ -1081,13 +1081,22 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         self.assertEqual(main(env={"GITHUB_ACTIONS": "true"},
                               job_fn=official, media_job_fn=media), 1)
-        self.assertEqual(calls, ["official", "media"])
+        self.assertEqual(calls, ["media", "official"], "媒體失敗時官方仍必須執行")
 
         calls.clear()
         self.assertEqual(main(env={"GITHUB_ACTIONS": "true"},
                               job_fn=lambda: (calls.append("official"), 1)[1],
                               media_job_fn=lambda: (calls.append("media"), 0)[1]), 1)
-        self.assertEqual(calls, ["official", "media"], "官方失敗時媒體仍必須執行")
+        self.assertEqual(calls, ["media", "official"])
+
+    def test_33b_media_runs_before_official(self):
+        """媒體只要十幾秒、官方約一小時；媒體排後面就要等官方跑完才寫得進去。"""
+        from main_pipeline import main
+        calls = []
+        main(env={"GITHUB_ACTIONS": "true"},
+             job_fn=lambda: (calls.append("official"), 0)[1],
+             media_job_fn=lambda: (calls.append("media"), 0)[1])
+        self.assertEqual(calls[0], "media")
 
 
 if __name__ == '__main__':
@@ -1667,3 +1676,98 @@ class _FakeUpsertCollection:
         class _Result:
             upserted_id = url if is_new else None
         return _Result()
+
+
+class TestMohwRetry(unittest.TestCase):
+    """真相說明爬蟲的重試與「列表失敗不整批中止」。
+
+    2026-09-13 GitHub Actions：第 5 頁列表 RemoteDisconnected，沒有重試、直接
+    break，那一輪只進 67 篇（應約 810 篇）。
+    """
+
+    MOHW = "https://www.mohw.gov.tw/cp-4343-{}-1.html"
+
+    @staticmethod
+    def _http_error(status):
+        resp = requests.Response()
+        resp.status_code = status
+        return requests.HTTPError(response=resp)
+
+    def test_transient_disconnect_is_retried(self):
+        calls, slept = [], []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise requests.ConnectionError("Remote end closed connection")
+            return "ok"
+
+        self.assertEqual(scraper_mohw.with_retries(flaky, sleep=slept.append), "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(slept, [2, 5])
+
+    def test_gives_up_after_three_attempts(self):
+        calls = []
+
+        def down():
+            calls.append(1)
+            raise requests.ConnectionError("down")
+
+        with self.assertRaises(requests.ConnectionError):
+            scraper_mohw.with_retries(down, sleep=lambda s: None)
+        self.assertEqual(len(calls), 3)
+
+    def test_404_is_not_retried(self):
+        """404 不重試：重打只是多等，而且 404 本來就不代表下架。"""
+        calls = []
+
+        def missing():
+            calls.append(1)
+            raise self._http_error(404)
+
+        with self.assertRaises(requests.HTTPError):
+            scraper_mohw.with_retries(missing, sleep=lambda s: None)
+        self.assertEqual(len(calls), 1)
+
+    def test_503_is_retried(self):
+        calls = []
+
+        def busy():
+            calls.append(1)
+            if len(calls) == 1:
+                raise self._http_error(503)
+            return "ok"
+
+        self.assertEqual(scraper_mohw.with_retries(busy, sleep=lambda s: None), "ok")
+
+    def _detail(self, url):
+        return {"title": "t", "content": "c", "source": "衛福部真相說明"}
+
+    def test_one_failed_list_page_does_not_stop_the_crawl(self):
+        """第 2 頁失敗，第 3 頁照樣要抓——以前是 break，後面全部丟掉。"""
+        pages = {
+            1: [(self.MOHW.format(1), "一", "2026-09-01")],
+            3: [(self.MOHW.format(3), "三", "2026-08-01")],
+        }
+
+        def list_rows(page):
+            if page == 2:
+                raise requests.ConnectionError("Remote end closed connection")
+            return pages.get(page, pages[3])  # 第 4 頁起重複第 3 頁＝翻過頭
+
+        articles = scraper_mohw.get_mohw_articles(
+            list_rows=list_rows, parse_detail=self._detail, sleep=lambda s: None)
+        self.assertEqual([a["title"] for a in articles], ["一", "三"])
+
+    def test_consecutive_list_failures_stop_the_crawl(self):
+        """站台整個掛掉時，連續 3 頁失敗就停，不對剩下上百頁各重試一輪。"""
+        calls = []
+
+        def list_rows(page):
+            calls.append(page)
+            raise requests.ConnectionError("down")
+
+        articles = scraper_mohw.get_mohw_articles(
+            list_rows=list_rows, parse_detail=self._detail, sleep=lambda s: None)
+        self.assertEqual(articles, [])
+        self.assertEqual(calls, [1, 2, 3])
