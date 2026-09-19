@@ -1771,3 +1771,99 @@ class TestMohwRetry(unittest.TestCase):
             list_rows=list_rows, parse_detail=self._detail, sleep=lambda s: None)
         self.assertEqual(articles, [])
         self.assertEqual(calls, [1, 2, 3])
+
+
+class FakeResponse:
+    """只帶 headers 與 content 的假回應，給 make_soup 用。"""
+
+    def __init__(self, content: bytes, content_type: str, encoding: str | None = None):
+        self.content = content
+        self.headers = {"content-type": content_type}
+        self.encoding = encoding
+
+
+class TestMakeSoupEncoding(unittest.TestCase):
+    """頁面沒有 <meta charset> 時，編碼要以 HTTP 標頭為準。
+
+    衛福部有一批頁面正是這樣：標頭寫 charset=utf-8、HTML 裡沒有 meta。
+    BeautifulSoup 自己猜會猜成西里爾語系，整篇存成亂碼而且不會報錯——
+    2026-09-19 在知識庫裡找到 10 篇這種文章。
+    """
+
+    HTML = "<html><body><div id='x'>疾病管制署今日表示</div></body></html>"
+
+    def test_header_charset_wins_when_page_has_no_meta(self):
+        from utils import make_soup
+
+        response = FakeResponse(
+            self.HTML.encode("utf-8"), "text/html; charset=utf-8", "utf-8"
+        )
+        soup = make_soup(response)
+        self.assertEqual(soup.select_one("#x").get_text(), "疾病管制署今日表示")
+
+    def test_defaults_to_utf8_when_header_has_no_charset(self):
+        from utils import make_soup
+
+        response = FakeResponse(self.HTML.encode("utf-8"), "text/html", None)
+        soup = make_soup(response)
+        self.assertEqual(soup.select_one("#x").get_text(), "疾病管制署今日表示")
+
+
+class TestClaimTagger(unittest.TestCase):
+    """政府闢謠文章的標籤抽取與過濾。"""
+
+    def test_claim_from_title_strips_leadin_and_agency(self):
+        from claim_tagger import claim_from_title
+
+        cases = {
+            "(疾管署) 網路謠傳，台灣愛滋防治政策失效導致感染數持續上升?": "台灣愛滋防治政策失效導致感染數持續上升",
+            "「皮蛋是用馬尿浸泡製成的」，這是真的嗎？": "皮蛋是用馬尿浸泡製成的",
+            "有關網路社群謠傳「高雄登革熱防治經費0元」，是真的嗎？": "高雄登革熱防治經費0元",
+            "(健康署) 確診或疑似感染COVID-19的婦女可以母乳哺育嗎？": "確診或疑似感染COVID-19的婦女可以母乳哺育嗎",
+        }
+        for title, expected in cases.items():
+            self.assertEqual(claim_from_title(title), expected, title)
+
+    def test_should_tag_keeps_short_but_real_rumors(self):
+        """短不是問題：「可樂會殺精」「吃正露丸會致癌」正是長輩最常轉傳的句型。
+
+        2026-09-19 原本設 8 字門檻，刷掉的多半是真謠言，已改成只擋 4 字以下。
+        名詞片語擋不擋交給查核管線的同一性驗證，不在這裡多設一道。
+        """
+        from claim_tagger import should_tag
+
+        for claim in ("可樂會殺精", "吃正露丸會致癌", "無花果不能吃", "吃肉桂能降血糖"):
+            row = {
+                "source": "食藥署闢謠專區",
+                "title": f"{claim}，這是真的嗎？",
+                "claim": claim,
+                "verdict": "錯誤",
+            }
+            self.assertTrue(should_tag(row), claim)
+
+    def test_should_tag_rejects_policy_responses(self):
+        """衛福部真相說明有一半在回應媒體報導，不是謠言；CARE 不對政策爭議發判定。"""
+        from claim_tagger import should_tag
+
+        policy = {
+            "source": "衛福部真相說明",
+            "title": "回應「申請長照平均耗32天」報導：持續強化家庭照顧者支持資源",
+            "claim": "申請長照平均耗32天，照顧者憂淪長照難民",
+            "verdict": "事實釐清",
+        }
+        rumor = {
+            "source": "衛福部真相說明",
+            "title": "網傳「每人補助疫情援助金1萬元」為假訊息",
+            "claim": "每人補助疫情援助金1萬元",
+            "verdict": "錯誤",
+        }
+        self.assertFalse(should_tag(policy))
+        self.assertTrue(should_tag(rumor))
+
+    def test_should_tag_requires_both_fields(self):
+        from claim_tagger import should_tag
+
+        base = {"source": "食藥署闢謠專區", "title": "「吃木瓜可以豐胸」，這是真的嗎？"}
+        self.assertFalse(should_tag({**base, "claim": "吃木瓜可以豐胸", "verdict": ""}))
+        self.assertFalse(should_tag({**base, "claim": "", "verdict": "錯誤"}))
+        self.assertTrue(should_tag({**base, "claim": "吃木瓜可以豐胸", "verdict": "錯誤"}))

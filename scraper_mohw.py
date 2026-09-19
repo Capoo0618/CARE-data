@@ -61,7 +61,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from ca_bundle import get_ca_bundle
-from utils import clean_html
+from utils import clean_html, make_soup
 
 BASE = "https://www.mohw.gov.tw"
 # 第 n 頁；每頁 20 筆。第 1 頁 `lp-4343-1-1-20.html` 與 `lp-4343-1.html` 同內容。
@@ -166,7 +166,7 @@ def _host(url):
 def _list_rows(page):
     """回傳某一頁列表的 (url, title, published_at) 三元組，保持頁面順序。"""
     url = LIST_URL_TEMPLATE.format(page=page)
-    soup = BeautifulSoup(with_retries(lambda: _get(url)).content, "html.parser")
+    soup = make_soup(with_retries(lambda: _get(url)))
     rows = []
     for item in soup.select(".list li"):
         anchor = item.find("a", href=True)
@@ -208,7 +208,7 @@ def _parse_detail(url):
     """抓單篇明細頁。解析不出標題或內文就回 None（由呼叫端計數）。"""
     host = _host(url)
     source_name, title_selector, body_selector = _DISPATCH[host]
-    soup = BeautifulSoup(with_retries(lambda: _get(url)).content, "html.parser")
+    soup = make_soup(with_retries(lambda: _get(url)))
     for tag in soup(["script", "style"]):
         tag.decompose()
 

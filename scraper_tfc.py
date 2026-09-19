@@ -20,7 +20,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from ca_bundle import get_ca_bundle
-from utils import clean_html
+from utils import clean_html, make_soup
 
 SOURCE_NAME = "台灣事實查核中心"
 BASE_URL = "https://tfc-taiwan.org.tw"
@@ -211,7 +211,7 @@ def _extract_content(soup) -> str:
 
 
 def _parse_report(url: str) -> dict | None:
-    soup = BeautifulSoup(_get(url).content, "html.parser")
+    soup = make_soup(_get(url))
     for tag in soup(["script", "style"]):
         if tag.name == "style" or tag.get("type") != "application/ld+json":
             tag.decompose()

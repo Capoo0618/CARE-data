@@ -40,6 +40,7 @@ from html import unescape
 
 import requests
 from bs4 import BeautifulSoup
+from utils import make_soup
 
 from ca_bundle import get_ca_bundle
 
@@ -104,7 +105,7 @@ def parse_gnews_entries(xml):
 
 def _excerpt(url):
     """文章頁的 og:description。抓不到回空字串，不讓一篇的失敗擋住整批。"""
-    soup = BeautifulSoup(_get(url).content, "html.parser")
+    soup = make_soup(_get(url))
     meta = soup.find("meta", {"property": "og:description"}) or soup.find(
         "meta", {"name": "description"})
     return (meta.get("content") or "").strip() if meta else ""

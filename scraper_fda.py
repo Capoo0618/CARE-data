@@ -18,7 +18,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from ca_bundle import get_ca_bundle
-from utils import clean_html
+from utils import clean_html, make_soup
 
 SOURCE_NAME = "食藥署闢謠專區"
 BASE = "https://www.fda.gov.tw/TC"
@@ -57,7 +57,7 @@ def _article_ids(page: int) -> list[str]:
 def _parse_detail(article_id: str) -> dict | None:
     """抓單篇詳細頁。解析不出標題或內容就回 None（由呼叫端計數）。"""
     url = f"{BASE}/newsContent.aspx?cid=5049&id={article_id}"
-    soup = BeautifulSoup(_get(url).content, "html.parser")
+    soup = make_soup(_get(url))
     for tag in soup(["script", "style"]):
         tag.decompose()
 

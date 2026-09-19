@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 
 # 匯入我們自己寫好的爬蟲模組
+from claim_tagger import tag_untagged
 from scraper_api import get_api_articles
 from scraper_fda import get_fda_articles
 from scraper_mohw import get_mohw_articles
@@ -493,6 +494,23 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
         print(f"❌ 嚴重：MongoDB 連線或上傳失敗: {e}")
         print("   本次執行將以非零狀態碼結束。")
         exit_code = 1
+
+    # 階段三：替新收的政府闢謠文章補查核標籤。
+    #
+    # 為什麼放在 ETL 裡而不是只留一支遷移腳本：`upload_to_mongodb` 只會替
+    # TFC 寫 verdict／claim，其餘來源永遠是 None，而查核比對只認帶 verdict 的
+    # 文件——不補，每天新收的闢謠文章就只會躺在庫裡被檢索、卻永遠產不出判定。
+    #
+    # 失敗不影響退出碼：標籤是加值，補不成下一次 ETL 會再試（重複執行安全）。
+    # 呼叫次數等於「這次新收且還沒標籤的篇數」，穩定狀態下是個位數。
+    print("\n[階段三：替政府闢謠文章補查核標籤]")
+    try:
+        if API_KEY:
+            tag_untagged(collection_factory(), API_KEY)
+        else:
+            print("  跳過：沒有 GEMINI_API_KEY")
+    except Exception as e:  # noqa: BLE001 - 加值步驟，不能影響 ETL 的結果
+        print(f"  ⚠️ 補標籤失敗，略過（下次執行會再試）: {type(e).__name__}: {e}")
 
     return exit_code
 
