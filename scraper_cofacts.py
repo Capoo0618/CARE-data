@@ -78,8 +78,8 @@ query($cats: [String], $after: String) {
     after: $after
     orderBy: [{ createdAt: DESC }]
   ) {
-    pageInfo { lastCursor }
     edges {
+      cursor
       node {
         id
         text
@@ -201,7 +201,10 @@ def get_cofacts_articles(
                     continue
                 seen.add(node["id"])
                 articles.append(_to_article(node, picked[1], picked[0]))
-            after = listing["pageInfo"]["lastCursor"]
+            # 用**最後一筆 edge 的 cursor**，不是 pageInfo.lastCursor：後者是
+            # 整個結果集最末筆的游標，拿它當 after 等於直接跳到結尾，第二頁就
+            # 回 0 筆。2026-09-19 第一次匯入就踩到，1,049 篇只收到第一頁的 26 篇。
+            after = edges[-1]["cursor"]
             if test_mode and len(articles) >= 3:
                 return articles
             # 對方是公益服務，翻頁之間讓一下。

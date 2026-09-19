@@ -1903,15 +1903,14 @@ class TestCofactsScraper(unittest.TestCase):
         import scraper_cofacts
 
         pages = iter([{"ListArticles": {
-            "pageInfo": {"lastCursor": None},
-            "edges": [{"node": n} for n in nodes],
-        }}, {"ListArticles": {"pageInfo": {"lastCursor": None}, "edges": []}}])
+            "edges": [{"cursor": f"c{i}", "node": n} for i, n in enumerate(nodes)],
+        }}, {"ListArticles": {"edges": []}}])
 
         def post(query, variables, timeout=60):
             try:
                 return next(pages)
             except StopIteration:
-                return {"ListArticles": {"pageInfo": {"lastCursor": None}, "edges": []}}
+                return {"ListArticles": {"edges": []}}
 
         return scraper_cofacts.get_cofacts_articles(
             categories=["medical"], post=post, sleep=lambda s: None)
@@ -2017,3 +2016,43 @@ class TestMyGoPenScraper(unittest.TestCase):
             self._entry("【錯誤】網傳某某說法", url="https://www.mygopen.com/2026/09/y.html"),
         ])
         self.assertEqual([r["url"] for r in rows], ["https://www.mygopen.com/2026/09/y.html"])
+
+
+class TestCofactsPagination(unittest.TestCase):
+    """翻頁要用最後一筆 edge 的 cursor。
+
+    pageInfo.lastCursor 是整個結果集最末筆的游標，拿它當 after 等於跳到結尾——
+    2026-09-19 第一次匯入就是這樣，每個分類只收到第一頁。
+    """
+
+    def test_uses_last_edge_cursor_to_paginate(self):
+        import scraper_cofacts
+
+        def node(i):
+            return {
+                "id": f"a{i}",
+                "text": "網傳吃鳳梨心可以治好痛風不用看醫生真的假的" + str(i),
+                "createdAt": "2026-09-01T00:00:00.000Z",
+                "articleReplies": [{
+                    "positiveFeedbackCount": 5,
+                    "negativeFeedbackCount": 0,
+                    "reply": {"id": "r", "type": "RUMOR", "text": "假的", "reference": "https://ref.tw"},
+                }],
+            }
+
+        seen_after = []
+        pages = [
+            {"ListArticles": {"edges": [{"cursor": f"c{i}", "node": node(i)} for i in range(2)]}},
+            {"ListArticles": {"edges": [{"cursor": "c9", "node": node(9)}]}},
+            {"ListArticles": {"edges": []}},
+        ]
+
+        def post(query, variables, timeout=60):
+            seen_after.append(variables["after"])
+            return pages.pop(0)
+
+        rows = scraper_cofacts.get_cofacts_articles(
+            categories=["medical"], post=post, sleep=lambda s: None)
+
+        self.assertEqual(seen_after, [None, "c1", "c9"])
+        self.assertEqual(len(rows), 3)
