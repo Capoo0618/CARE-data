@@ -9,6 +9,7 @@ from pymongo import MongoClient
 # 匯入我們自己寫好的爬蟲模組
 from claim_tagger import tag_untagged
 from scraper_api import get_api_articles
+from scraper_cofacts import get_cofacts_articles
 from scraper_fda import get_fda_articles
 from scraper_mohw import get_mohw_articles
 from scraper_media import COLLECTION_NAME as MEDIA_COLLECTION_NAME, media_job
@@ -45,6 +46,10 @@ EXPECTED_SOURCES = frozenset({
     # mohw / hpa / cdc 三個站上，全部標成「衛福部」就是引用錯機關。
     "衛福部真相說明",
     "國健署真相與闢謠",
+    # Cofacts 真的假的（scraper_cofacts，走官方 GraphQL API）。列入的理由同
+    # 其他來源：它是目前涵蓋民眾實際轉傳訊息最廣的一批，一篇都沒有代表 API
+    # 掛了或品質門檻寫壞了，不該無聲通過。
+    "Cofacts 真的假的",
     # 「疾管署闢謠專區」刻意**不**列入：那 24 筆全部是 110 年 COVID 時期的
     # 舊文，站方已多年沒有新增。
     #
@@ -456,6 +461,7 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
             lambda: get_fda_articles(test_mode=False),
             lambda: get_tfc_articles(test_mode=False),
             lambda: get_mohw_articles(test_mode=False),
+            lambda: get_cofacts_articles(test_mode=False),
         )
     collection_factory = collection_factory or _default_collection
 

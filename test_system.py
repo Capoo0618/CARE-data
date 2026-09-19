@@ -976,6 +976,11 @@ class TestHealthETLPipeline(unittest.TestCase):
              "title": "真相說明文章", "content": "內容", "updated_at": None},
             {"source": "國健署真相與闢謠", "url": "https://example.tw/hpa-truth",
              "title": "真相與闢謠文章", "content": "內容", "updated_at": None},
+            # Cofacts 帶著自己的判定進來（其他來源的 verdict 由 claim_tagger
+            # 事後補，它是唯一在爬蟲階段就有判定的非 TFC 來源）。
+            {"source": "Cofacts 真的假的", "url": "https://cofacts.tw/article/x",
+             "title": "協作查核文章", "content": "內容", "updated_at": None,
+             "verdict": "錯誤", "verdict_slug": "incorrect", "claim": "吃鳳梨心可以治痛風"},
             # 「疾管署闢謠專區」刻意不在這裡：它不在 EXPECTED_SOURCES 內，
             # 加進來不會影響退出碼，但會讓這份 fixture 與那份集合失去對應。
         ]
@@ -1867,3 +1872,95 @@ class TestClaimTagger(unittest.TestCase):
         self.assertFalse(should_tag({**base, "claim": "吃木瓜可以豐胸", "verdict": ""}))
         self.assertFalse(should_tag({**base, "claim": "", "verdict": "錯誤"}))
         self.assertTrue(should_tag({**base, "claim": "吃木瓜可以豐胸", "verdict": "錯誤"}))
+
+
+class TestCofactsScraper(unittest.TestCase):
+    """Cofacts 的品質門檻與內文組法。"""
+
+    @staticmethod
+    def _node(text, replies):
+        return {
+            "id": "abc",
+            "text": text,
+            "createdAt": "2026-09-01T00:00:00.000Z",
+            "articleReplies": replies,
+        }
+
+    @staticmethod
+    def _reply(rtype="RUMOR", positive=5, negative=0, reference="https://ref.tw/1"):
+        return {
+            "positiveFeedbackCount": positive,
+            "negativeFeedbackCount": negative,
+            "reply": {
+                "id": "r1",
+                "type": rtype,
+                "text": "假的，沒有這回事。",
+                "reference": reference,
+            },
+        }
+
+    def _fetch(self, nodes):
+        import scraper_cofacts
+
+        pages = iter([{"ListArticles": {
+            "pageInfo": {"lastCursor": None},
+            "edges": [{"node": n} for n in nodes],
+        }}, {"ListArticles": {"pageInfo": {"lastCursor": None}, "edges": []}}])
+
+        def post(query, variables, timeout=60):
+            try:
+                return next(pages)
+            except StopIteration:
+                return {"ListArticles": {"pageInfo": {"lastCursor": None}, "edges": []}}
+
+        return scraper_cofacts.get_cofacts_articles(
+            categories=["medical"], post=post, sleep=lambda s: None)
+
+    def test_skips_opinionated_and_unsourced_and_low_feedback(self):
+        """三種都不是「有人背書的真假判定」，收進來只會讓判定卡失去可信度。"""
+        import scraper_cofacts
+
+        cases = {
+            "個人意見": self._reply(rtype="OPINIONATED"),
+            "沒附出處": self._reply(reference=""),
+            "正評不足": self._reply(positive=2),
+            "負評蓋過": self._reply(positive=4, negative=3),
+        }
+        for name, reply in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(
+                    scraper_cofacts.pick_reply([reply]), name)
+
+    def test_skips_url_only_and_too_short_messages(self):
+        """實測 8～22% 的回報只有一條 YouTube 連結，那種當主張沒有意義。"""
+        rows = self._fetch([
+            self._node("https://youtu.be/abcdefg", [self._reply()]),
+            self._node("太短", [self._reply()]),
+        ])
+        self.assertEqual(rows, [])
+
+    def test_maps_reply_type_to_verdict(self):
+        rumor = self._fetch([self._node("網傳吃鳳梨心可以治好痛風不用看醫生真的假的", [self._reply()])])
+        self.assertEqual(rumor[0]["verdict"], "錯誤")
+        self.assertEqual(rumor[0]["verdict_slug"], "incorrect")
+
+        truth = self._fetch([
+            self._node("疾管署說流感疫苗每年都要打才有保護力這是真的嗎",
+                       [self._reply(rtype="NOT_RUMOR")])])
+        self.assertEqual(truth[0]["verdict"], "正確")
+
+    def test_content_starts_with_the_original_message(self):
+        """比對打在切片向量上；只放反駁那段，使用者的謠言原文對不上。"""
+        rows = self._fetch([self._node("網傳吃鳳梨心可以治好痛風不用看醫生真的假的", [self._reply()])])
+        content = rows[0]["content"]
+        self.assertTrue(content.startswith("網傳訊息：網傳吃鳳梨心"), content[:40])
+        self.assertIn("查核回覆：", content)
+        self.assertIn("出處：", content)
+
+    def test_carries_licence_attribution(self):
+        """CC BY-SA 4.0 要求顯示時標明社群與授權。"""
+        import scraper_cofacts
+
+        rows = self._fetch([self._node("網傳吃鳳梨心可以治好痛風不用看醫生真的假的", [self._reply()])])
+        self.assertEqual(rows[0]["attribution"], scraper_cofacts.COFACTS_ATTRIBUTION)
+        self.assertIn("CC BY-SA 4.0", rows[0]["attribution"])
