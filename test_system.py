@@ -1964,3 +1964,56 @@ class TestCofactsScraper(unittest.TestCase):
         rows = self._fetch([self._node("網傳吃鳳梨心可以治好痛風不用看醫生真的假的", [self._reply()])])
         self.assertEqual(rows[0]["attribution"], scraper_cofacts.COFACTS_ATTRIBUTION)
         self.assertIn("CC BY-SA 4.0", rows[0]["attribution"])
+
+
+class TestMyGoPenScraper(unittest.TestCase):
+    """MyGoPen 的標題解析與「只取標題與連結」的授權界線。"""
+
+    @staticmethod
+    def _entry(title, url="https://www.mygopen.com/2026/09/x.html"):
+        return {
+            "title": {"$t": title},
+            "published": {"$t": "2026-09-01T10:00:00.000+08:00"},
+            "link": [{"rel": "alternate", "href": url}],
+            "content": {"$t": "<p>完整內文不該被存下來</p>"},
+        }
+
+    def _fetch(self, entries):
+        import scraper_mygopen
+
+        pages = [{"entry": entries}, {"entry": []}]
+
+        def fetch(start_index):
+            return pages.pop(0) if pages else {"entry": []}
+
+        return scraper_mygopen.get_mygopen_articles(fetch=fetch, sleep=lambda s: None)
+
+    def test_parses_verdict_prefix(self):
+        from scraper_mygopen import parse_title
+
+        self.assertEqual(
+            parse_title("【錯誤】網傳「吃鳳梨心可以治痛風」？"),
+            ("錯誤", "incorrect", "網傳「吃鳳梨心可以治痛風」"),
+        )
+        # MyGoPen 特有的前綴依語意歸併到 CARE 認得的五個判定
+        self.assertEqual(parse_title("【易生誤解】某某說法")[0], "部分錯誤")
+        self.assertEqual(parse_title("【詐騙】假冒衛福部簡訊")[0], "錯誤")
+        # 認不得的前綴不猜
+        self.assertIsNone(parse_title("【活動】謠言惑眾獎票選"))
+        self.assertIsNone(parse_title("沒有前綴的標題"))
+
+    def test_stores_claim_and_link_only(self):
+        """授權界線：MyGoPen 沒有開放授權聲明，在取得授權前不存內文。"""
+        rows = self._fetch([self._entry("【錯誤】網傳「吃鳳梨心可以治痛風」？")])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["content"], row["claim"])
+        self.assertNotIn("完整內文", row["content"])
+        self.assertTrue(row["url"].startswith("https://www.mygopen.com/"))
+
+    def test_skips_entries_without_recognised_verdict(self):
+        rows = self._fetch([
+            self._entry("【活動】2026 教師研習營"),
+            self._entry("【錯誤】網傳某某說法", url="https://www.mygopen.com/2026/09/y.html"),
+        ])
+        self.assertEqual([r["url"] for r in rows], ["https://www.mygopen.com/2026/09/y.html"])
