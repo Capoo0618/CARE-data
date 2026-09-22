@@ -4,7 +4,7 @@
 
 本專案採用 **Microservices（微服務）架構**，將對外提供即時服務的 LINE Bot 與耗時的資料蒐集、清洗、向量化流程完全解耦。
 
-系統每日自動從政府公開 API 與台灣事實查核中心（TFC）取得最新健康闢謠文章，經過 NLP 切片、Gemini Embedding 向量化後，寫入 MongoDB，提供前端 Bot 作為 Retrieval-Augmented Generation（RAG）的知識庫。
+系統每日自動從政府公開 API 與台灣事實查核中心（TFC）取得最新健康闢謠文章，經過 NLP 切片、Gemini Embedding 向量化後，內文寫入 MongoDB、向量寫入 care-vm 上的 pgvector，提供前端 Bot 作為 Retrieval-Augmented Generation（RAG）的知識庫。
 
 ## 資料來源
 
@@ -89,12 +89,13 @@ TFC 是四個來源裡唯一本來就在做查核的——其餘三個是政府�
 
 # 系統特色
 
-## Serverless 自動化 ETL
+## 在 care-vm 上每天自動執行
 
-- 使用 GitHub Actions 建立 CI/CD 與排程流程
-- 每日早上 **08:00（台灣時間）** 自動啟動 ETL
-- 不需維護本地伺服器
-- 可降低目標網站封鎖固定 IP 的風險
+- CARE-infra 的 `care-etl` CronJob 每天 **05:00（台灣時間）** 啟動一次
+- 2026-09-22 之前跑在 GitHub Actions；搬進叢集是因為向量要直接寫叢集內的
+  pgvector（ClusterIP，叢集外連不到），理由見 `vector_store.py`
+- 每次執行結尾會把 PG 與 Mongo 對帳：刪掉找不到內文的孤兒向量、把 Mongo 的
+  判定同步進 PG（查核比對是在 PG 篩判定的）
 
 ---
 
@@ -127,10 +128,11 @@ TFC 是四個來源裡唯一本來就在做查核的——其餘三個是政府�
 
 ## 失敗必須可見
 
-ETL 在以下情況會以**非零狀態碼**結束，讓 GitHub Actions 顯示紅燈：
+ETL 在以下情況會以**非零狀態碼**結束，讓 CronJob 的 Job 標成失敗：
 
 - 四個來源中有任一個本次完全沒有取得文章（爬蟲失效、來源改版、網路或憑證問題）
-- 知識庫寫入階段失敗
+- 知識庫寫入階段失敗（Mongo 或 pgvector 任一邊）
+- 向量庫對帳失敗，或孤兒超過 PG 的一半而拒絕刪除（多半是 Mongo 查錯了）
 
 資料面仍然盡力而為：單一來源或單篇文章失敗不會阻擋其餘資料寫入，
 只是該次執行會被標記為失敗。本機常駐排程模式不因單次失敗終止程序。
@@ -155,11 +157,14 @@ ETL 在以下情況會以**非零狀態碼**結束，讓 GitHub Actions 顯示�
 CARE-data/
 ├── .github/
 │   └── workflows/
-│       └── etl_pipeline.yml      # GitHub Actions 排程
+│       └── test.yml              # 單元測試（ETL 本身由 care-etl CronJob 執行）
 ├── openspec/                     # 規格與進行中的變更（spec-driven 工作流程）
 ├── certs/                        # 釘選的中繼憑證（公開資料，見 certs/README.md）
 ├── migrations/                   # 一次性資料遷移腳本（用過即成為歷史紀錄）
 ├── main_pipeline.py              # ETL 主流程
+├── vector_store.py               # pgvector 寫入與 PG／Mongo 對帳
+├── claim_tagger.py               # 替政府闢謠文章補 claim／verdict
+├── Dockerfile                    # care-etl 映像（CARE-infra 的 cicd build）
 ├── scraper_api.py                # 政府 API 爬蟲（食藥署公告、衛福部）
 ├── scraper_fda.py                # 食藥署闢謠專區網頁爬蟲
 ├── scraper_tfc.py                # 台灣事實查核中心爬蟲
@@ -202,12 +207,15 @@ LINE Bot (RAG)
 
 # 環境變數
 
-無論本地開發或 GitHub Actions 部署，都需要設定以下環境變數。
-
 | 變數 | 說明 |
 |------|------|
 | `GEMINI_API_KEY` | Google Gemini API 金鑰，用於文字向量化 |
 | `MONGO_URI` | MongoDB Atlas 連線字串 |
+| `PGVECTOR_SYNC_DSN` | pgvector 的寫入帳號（`care_sync`）。沒設 ETL 會直接失敗，不會退回把向量寫進 Atlas |
+| `ETL_RUN_ONCE` | 設 `1` 為單次執行（CronJob 用）；不設則是本機常駐排程 |
+
+叢集上這些值來自 `care-backend-secret`（由 CARE-infra 的 cicd 從 GitHub Secrets 建立），
+`MONGO_URI` 對應其中的 `MONGODB_URI`。
 
 本地可建立 `.env`：
 
@@ -216,15 +224,6 @@ GEMINI_API_KEY=YOUR_API_KEY
 MONGO_URI=mongodb+srv://<user>:<password>@cluster...
 ```
 
-GitHub 部署請於：
-
-```
-Settings
-→ Secrets and variables
-→ Actions
-```
-
-新增相同名稱的 Secret。
 
 ---
 
@@ -257,46 +256,38 @@ uv run python test_system.py
 uv run python main_pipeline.py
 ```
 
-本地模式預設為常駐排程執行。
+本地模式預設為常駐排程執行。注意 pgvector 在叢集內（ClusterIP），本機連不到，
+所以本機只能跑測試；要實際寫入就到叢集手動觸發 CronJob（見下方）。
 
 ---
 
 # 自動部署
 
-本專案採用 GitHub Actions 自動部署。
-
-只要將程式 Push 至 `main` 分支，即可自動更新。
+推上 `main` 後，`trigger-deploy.yml` 通知 CARE-infra 重新 build `yanagi0912/care-etl`
+映像並部署；CronJob 下一次執行就是新版。
 
 ## 定時執行
 
-依照 `.github/workflows/etl_pipeline.yml` 設定：
-
-- UTC：00:00
-- 台灣時間（UTC+8）：08:00
-
-每天自動執行一次 ETL。
-
----
+`care-etl` CronJob（CARE-infra `helm/care/templates/etl-cronjob.yaml`），每天
+台灣時間 05:00。
 
 ## 手動執行
 
-GitHub 專案頁面：
+在 care-vm 上：
 
+```bash
+kubectl create job -n care-dev --from=cronjob/care-etl care-etl-manual-$(date +%s)
+kubectl logs -n care-dev -f job/<上面建立的名稱>
 ```
-Actions
-→ Daily Health ETL Pipeline
-→ Run workflow
-```
-
-即可立即執行最新 ETL。
 
 ---
 
 # 技術架構
 
 - Python
-- GitHub Actions
-- MongoDB Atlas
+- Kubernetes CronJob（K3s on care-vm）
+- MongoDB Atlas（內文、BM25）
+- PostgreSQL + pgvector（向量）
 - Google Gemini Embedding API
 - BeautifulSoup
 - Requests

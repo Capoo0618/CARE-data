@@ -1,9 +1,9 @@
 [project]
 name = "care-data"
 version = "0.1.0"
-description = "CARE 健康資料 ETL：食藥署／疾管署／TFC 爬蟲與 MongoDB 寫入"
+description = "CARE 健康資料 ETL：食藥署／疾管署／TFC 爬蟲，內文寫 MongoDB、向量寫 pgvector"
 readme = "README.md"
-# 與 .github/workflows/etl_pipeline.yml 的 setup-python 一致
+# 與 .python-version、Dockerfile 的基底映像一致
 requires-python = ">=3.10"
 
 dependencies = [
@@ -16,6 +16,9 @@ dependencies = [
     # gov.tw 站台要釘 TWCA 中繼憑證才連得上（見 ca_bundle.py），
     # 憑證庫版本太舊會讓爬蟲整批誤判為「連不上」。
     "certifi>=2024.2.2",
+    # 向量寫進 care-vm 的 pgvector（見 vector_store.py）。binary 版自帶 libpq，
+    # 映像不必另外裝 postgresql-client。
+    "psycopg[binary]==3.3.6",
 ]
 
 # ETL 是可執行腳本集合不是函式庫，不建置成套件。

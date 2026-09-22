@@ -67,6 +67,46 @@ class FakeCollection:
         url = filt.get("url")
         return sum(1 for doc in self.docs if doc.get("url") == url)
 
+    def find(self, filt, projection=None):
+        """支援 {"url": ...} 與 {}（全部）—— 與 main_pipeline／reconcile 用法一致。
+        沒有 _id 的舊測資（手寫的既有文件）補一個，模擬 Mongo 的行為。"""
+        from bson import ObjectId
+        for doc in self.docs:
+            doc.setdefault("_id", ObjectId())
+        return [d for d in self.docs
+                if all(d.get(k) == v for k, v in filt.items())]
+
+
+class FakeVectorStore:
+    """記錄呼叫的假 pgvector，介面同 vector_store.PgVectorStore。"""
+
+    def __init__(self, rows=None):
+        # {id: (vector, verdict)}
+        self.rows = dict(rows or {})
+        self.deleted = []
+        self.closed = False
+
+    def upsert(self, rows):
+        for i, vector, verdict in rows:
+            self.rows[str(i)] = (vector, verdict)
+
+    def delete_ids(self, ids):
+        ids = [str(i) for i in ids]
+        self.deleted.extend(ids)
+        for i in ids:
+            self.rows.pop(i, None)
+
+    def all_verdicts(self):
+        return {i: verdict for i, (_, verdict) in self.rows.items()}
+
+    def set_verdicts(self, pairs):
+        for i, verdict in pairs:
+            vector, _ = self.rows[str(i)]
+            self.rows[str(i)] = (vector, verdict)
+
+    def close(self):
+        self.closed = True
+
 
 def fake_embed_ok(text):
     return [0.1, 0.2, 0.3]
@@ -287,7 +327,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             "url": "https://example.com/a",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=make_failing_embed(2))
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=make_failing_embed(2))
 
         self.assertEqual(collection.inserted_batches, [],
                          "有 chunk 向量化失敗時，不應寫入任何一筆")
@@ -304,7 +344,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             "url": "https://example.com/a",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertEqual(len(collection.inserted_batches), 1, "應該只有一次批次寫入")
         batch = collection.inserted_batches[0]
@@ -327,7 +367,7 @@ class TestHealthETLPipeline(unittest.TestCase):
              "url": "https://example.com/new"},
         ]
 
-        upload_to_mongodb(articles, collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb(articles, collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         written_urls = {d["url"] for b in collection.inserted_batches for d in b}
         self.assertIn("https://example.com/new", written_urls,
@@ -346,7 +386,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             {"title": "全新文章B", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
         ]
 
-        upload_to_mongodb(articles, collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb(articles, collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         written = {d["original_title"] for b in collection.inserted_batches for d in b}
         self.assertNotIn("已存在的文章", written, "標題已存在者應跳過")
@@ -367,7 +407,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             "published_at": "2025-12-01", "updated_at": "2026-08-01",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertIn({"url": "https://example.com/a"}, collection.deleted_filters,
                       "修改日期不同時，應先刪除該 url 的既有 chunk")
@@ -387,7 +427,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             "url": "https://example.com/a", "updated_at": "2026-08-01",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertEqual(collection.inserted_batches, [], "沒有更新就不該重寫")
         self.assertEqual(collection.deleted_filters, [], "沒有更新就不該刪除")
@@ -406,7 +446,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             "published_at": "2025-12-01", "updated_at": "2026-08-01",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=make_failing_embed(2))
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=make_failing_embed(2))
 
         self.assertEqual(collection.deleted_filters, [],
                          "向量化失敗時不得刪除舊版本")
@@ -490,7 +530,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             calls.append(text)
             return [0.5] * 3072
 
-        upload_to_mongodb([article], collection, embed_fn=counting_embed)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=counting_embed)
 
         self.assertEqual(calls, [], "既有資料只需補日期，不應重新呼叫向量化 API")
         self.assertEqual(collection.deleted_filters, [], "不應刪除任何既有切片")
@@ -527,7 +567,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         def counting_embed(text):
             raise AssertionError("既有資料不應重新向量化")
 
-        upload_to_mongodb([article], collection, embed_fn=counting_embed)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=counting_embed)
 
         doc = collection.docs[0]
         self.assertEqual(doc["verdict"], "錯誤")
@@ -561,7 +601,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         ]
 
         new_count, write_failed = upload_to_mongodb(
-            articles, collection, embed_fn=fake_embed_ok)
+            articles, collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertTrue(write_failed, "寫入失敗必須回報，否則 CI 不會紅燈")
         self.assertEqual(new_count, 1, "後面的文章不應被前一篇的例外連累")
@@ -583,7 +623,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         }
 
         new_count, write_failed = upload_to_mongodb(
-            [article, dict(article)], collection, embed_fn=fake_embed_ok)
+            [article, dict(article)], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertFalse(write_failed)
         self.assertEqual(new_count, 1)
@@ -608,7 +648,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             "title": "有舊版的文章", "content": "", "updated_at": "2024/09/09",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertEqual(collection.deleted_filters, [], "不應刪除舊版")
         self.assertEqual(len(collection.docs), 1)
@@ -638,7 +678,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         }
 
         new_count, write_failed = upload_to_mongodb(
-            [article], collection, embed_fn=fake_embed_ok)
+            [article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertFalse(write_failed)
         self.assertEqual(new_count, 1, "破洞文章應被重寫")
@@ -679,7 +719,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             calls.append(text)
             return [0.5] * 3072
 
-        upload_to_mongodb([article], collection, embed_fn=counting_embed)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=counting_embed)
 
         self.assertEqual(calls, [], "完整的既有文章不應重新向量化")
         self.assertEqual(collection.deleted_filters, [], "不應刪除任何切片")
@@ -706,7 +746,7 @@ class TestHealthETLPipeline(unittest.TestCase):
             "published_at": "2025-12-01", "updated_at": "2026-08-01",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=make_failing_embed(2))
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=make_failing_embed(2))
 
         self.assertEqual(collection.deleted_filters, [],
                          "向量化失敗時不得刪除舊版本")
@@ -741,7 +781,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         }
 
         new_count, write_failed = upload_to_mongodb(
-            [article], collection, embed_fn=fake_embed_ok)
+            [article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertTrue(write_failed)
         self.assertEqual(new_count, 0)
@@ -773,7 +813,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         }
 
         new_count, write_failed = upload_to_mongodb(
-            [article], collection, embed_fn=fake_embed_ok)
+            [article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertFalse(write_failed)
         self.assertEqual(new_count, 1, "日期相同但切片數不符時仍須修復")
@@ -796,7 +836,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         ]
 
         new_count, write_failed = upload_to_mongodb(
-            articles, collection, embed_fn=lambda text: [])
+            articles, collection, vector_store=FakeVectorStore(), embed_fn=lambda text: [])
 
         self.assertEqual(new_count, 0)
         self.assertTrue(write_failed,
@@ -819,7 +859,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         ]
 
         new_count, write_failed = upload_to_mongodb(
-            articles, collection, embed_fn=make_failing_embed(1))
+            articles, collection, vector_store=FakeVectorStore(), embed_fn=make_failing_embed(1))
 
         self.assertEqual(new_count, 1)
         self.assertFalse(write_failed, "只要有文章成功寫入就不算系統性失敗")
@@ -839,9 +879,9 @@ class TestHealthETLPipeline(unittest.TestCase):
             "title": "", "content": "有內容但沒有標題", "updated_at": None,
         }
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
         first_run = len(collection.docs)
-        upload_to_mongodb([dict(article)], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([dict(article)], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertEqual(len(collection.docs), first_run,
                          "第二次執行不應再寫入一次")
@@ -868,7 +908,8 @@ class TestHealthETLPipeline(unittest.TestCase):
             "published_at": "2024/01/01", "updated_at": "2024/03/15",
         }
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        store = FakeVectorStore()
+        upload_to_mongodb([article], collection, vector_store=store, embed_fn=fake_embed_ok)
 
         expected_chunks = chunk_text(content)
         self.assertGreater(len(expected_chunks), 1, "測資本身要能切出多塊才有意義")
@@ -884,8 +925,10 @@ class TestHealthETLPipeline(unittest.TestCase):
             self.assertEqual(doc["chunk_index"], i + 1,
                              "chunk_index 由 1 起算")
             self.assertEqual(doc["total_chunks"], len(expected_chunks))
-            self.assertEqual(doc["embedding"], fake_embed_ok(""),
-                             "embedding 必須是向量化的結果")
+            self.assertNotIn("embedding", doc,
+                             "向量不能再寫進 Atlas——2026-09-19 就是這樣把免費層撐爆的")
+            self.assertEqual(store.rows[str(doc["_id"])], (fake_embed_ok(""), None),
+                             "向量必須以切片的 _id 寫進 pgvector")
             self.assertEqual(doc["published_at"], "2024/01/01")
             self.assertEqual(doc["updated_at"], "2024/03/15")
             self.assertIsInstance(doc["uploaded_at"], float)
@@ -908,7 +951,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         articles = [dict(base, title="標題甲"), dict(base, title="標題乙")]
 
         new_count, _ = upload_to_mongodb(
-            articles, collection, embed_fn=fake_embed_ok)
+            articles, collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertEqual(new_count, 1, "同一個 url 在一個批次內只能寫入一次")
         self.assertEqual(len(collection.docs), 1)
@@ -926,7 +969,7 @@ class TestHealthETLPipeline(unittest.TestCase):
                 "title": "同一篇文章", "content": "內容", "updated_at": None}
 
         new_count, _ = upload_to_mongodb(
-            [dict(base), dict(base)], collection, embed_fn=fake_embed_ok)
+            [dict(base), dict(base)], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertEqual(new_count, 1, "url 為 None 時標題就是去重鍵")
         self.assertEqual(len(collection.docs), 1)
@@ -950,7 +993,7 @@ class TestHealthETLPipeline(unittest.TestCase):
         }
 
         new_count, _ = upload_to_mongodb(
-            [article], collection, embed_fn=fake_embed_ok)
+            [article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertEqual(new_count, 0, "url 已存在就該跳過")
         self.assertEqual(len(collection.docs), 1)
@@ -998,6 +1041,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         rc = job(fetchers=(lambda: articles,),
                  collection_factory=lambda: collection,
+                 vector_store_factory=FakeVectorStore,
                  embed_fn=fake_embed_ok)
 
         self.assertEqual(rc, 0)
@@ -1017,6 +1061,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         rc = job(fetchers=(lambda: articles,),
                  collection_factory=lambda: collection,
+                 vector_store_factory=FakeVectorStore,
                  embed_fn=fake_embed_ok)
 
         self.assertEqual(rc, 1, "有來源一篇都沒抓到必須讓 CI 紅燈")
@@ -1032,6 +1077,7 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         rc = job(fetchers=(lambda: self._all_source_articles(),),
                  collection_factory=unreachable,
+                 vector_store_factory=FakeVectorStore,
                  embed_fn=fake_embed_ok)
 
         self.assertEqual(rc, 1)
@@ -1048,29 +1094,30 @@ class TestHealthETLPipeline(unittest.TestCase):
 
         rc = job(fetchers=(lambda: self._all_source_articles(),),
                  collection_factory=lambda: collection,
+                 vector_store_factory=FakeVectorStore,
                  embed_fn=fake_embed_ok)
 
         self.assertEqual(rc, 1, "job() 不得忽略 upload_to_mongodb 回報的失敗")
 
     def test_33_ci_mode_propagates_the_exit_code(self):
-        """GITHUB_ACTIONS 模式必須把 job() 的退出碼交回給作業系統。
+        """單次執行模式（ETL_RUN_ONCE=1）必須把 job() 的退出碼交回給作業系統。
 
         整條「失敗必須可見」的鏈條，最後一環就是這裡：job() 算出 1，
-        但如果沒有一路傳到 sys.exit()，Actions 依然是綠燈。
+        但如果沒有一路傳到 sys.exit()，CronJob 依然顯示成功。
         常駐模式的無限迴圈無法在測試中執行，所以只測 CI 這一支。
         """
         from main_pipeline import main
 
         ok = lambda: 0  # noqa: E731 —— 媒體 job 的替身，這支只測官方那條
         self.assertEqual(
-            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 1, media_job_fn=ok), 1,
-            "job() 回傳 1 時 CI 模式必須也回傳 1")
+            main(env={"ETL_RUN_ONCE": "1"}, job_fn=lambda: 1, media_job_fn=ok), 1,
+            "job() 回傳 1 時單次模式必須也回傳 1")
         self.assertEqual(
-            main(env={"GITHUB_ACTIONS": "true"}, job_fn=lambda: 0, media_job_fn=ok), 0,
+            main(env={"ETL_RUN_ONCE": "1"}, job_fn=lambda: 0, media_job_fn=ok), 0,
             "成功時不得誤報失敗")
 
     def test_33a_media_failure_turns_ci_red_but_official_still_runs(self):
-        """媒體失敗要讓 Actions 紅燈，但官方 ETL 仍照常執行（反之亦然）。
+        """媒體失敗要讓 Job 標成失敗，但官方 ETL 仍照常執行（反之亦然）。
 
         兩支都要跑完才決定退出碼。若任一支失敗就提早結束，一個來源的暫時
         問題會讓另一個來源當天沒更新——那正是 job() 刻意避免的事。
@@ -1084,12 +1131,12 @@ class TestHealthETLPipeline(unittest.TestCase):
         def media():
             calls.append("media"); return 1
 
-        self.assertEqual(main(env={"GITHUB_ACTIONS": "true"},
+        self.assertEqual(main(env={"ETL_RUN_ONCE": "1"},
                               job_fn=official, media_job_fn=media), 1)
         self.assertEqual(calls, ["media", "official"], "媒體失敗時官方仍必須執行")
 
         calls.clear()
-        self.assertEqual(main(env={"GITHUB_ACTIONS": "true"},
+        self.assertEqual(main(env={"ETL_RUN_ONCE": "1"},
                               job_fn=lambda: (calls.append("official"), 1)[1],
                               media_job_fn=lambda: (calls.append("media"), 0)[1]), 1)
         self.assertEqual(calls, ["media", "official"])
@@ -1098,10 +1145,162 @@ class TestHealthETLPipeline(unittest.TestCase):
         """媒體只要十幾秒、官方約一小時；媒體排後面就要等官方跑完才寫得進去。"""
         from main_pipeline import main
         calls = []
-        main(env={"GITHUB_ACTIONS": "true"},
+        main(env={"ETL_RUN_ONCE": "1"},
              job_fn=lambda: (calls.append("official"), 0)[1],
              media_job_fn=lambda: (calls.append("media"), 0)[1])
         self.assertEqual(calls[0], "media")
+
+
+class TestPgVectorWrites(unittest.TestCase):
+    """向量寫 pgvector、內文寫 Mongo，兩邊要對得上。
+
+    2026-09-22 實測：PG 16,989 筆、Mongo 13,987 筆，3,002 筆向量找不到內文（重切
+    時刪了 Mongo 沒刪 PG），另有判定只寫進 Mongo、PG 看不到。這組測試守的就是
+    那兩個破口，外加「連不上 PG 時不能退回把向量寫進 Atlas」。
+    """
+
+    ARTICLE = {"source": "國健署新聞", "url": "https://example.tw/pg",
+               "title": "向量測試", "content": "內容。" * 10,
+               "updated_at": "2026/02/01"}
+
+    def test_rewrite_deletes_old_vectors(self):
+        from bson import ObjectId
+        from main_pipeline import upload_to_mongodb
+
+        old_id = ObjectId()
+        collection = FakeCollection([
+            {"_id": old_id, "url": self.ARTICLE["url"], "original_title": "向量測試",
+             "chunk_index": 1, "total_chunks": 1, "updated_at": "2026/01/01",
+             "chunker_version": _CURRENT_CHUNKER}])
+        store = FakeVectorStore({str(old_id): ([0.9], None)})
+
+        upload_to_mongodb([dict(self.ARTICLE)], collection,
+                          vector_store=store, embed_fn=fake_embed_ok)
+
+        self.assertIn(str(old_id), store.deleted, "改版重寫時舊版切片的向量要一起刪")
+        self.assertEqual(set(store.rows), {str(d["_id"]) for d in collection.docs},
+                         "PG 與 Mongo 的 id 必須一一對應")
+
+    def test_old_vector_delete_failure_keeps_new_version(self):
+        """刪舊向量失敗（例如 care_sync 沒有 DELETE 權限）不能讓新版跟著不見。"""
+        from bson import ObjectId
+        from main_pipeline import upload_to_mongodb
+
+        class NoDelete(FakeVectorStore):
+            def delete_ids(self, ids):
+                raise RuntimeError("permission denied for table health_articles_chunks")
+
+        old_id = ObjectId()
+        collection = FakeCollection([
+            {"_id": old_id, "url": self.ARTICLE["url"], "original_title": "向量測試",
+             "chunk_index": 1, "total_chunks": 1, "updated_at": "2026/01/01",
+             "chunker_version": _CURRENT_CHUNKER}])
+        store = NoDelete({str(old_id): ([0.9], None)})
+
+        new_count, write_failed = upload_to_mongodb(
+            [dict(self.ARTICLE)], collection, vector_store=store, embed_fn=fake_embed_ok)
+
+        self.assertEqual(new_count, 1)
+        self.assertFalse(write_failed)
+        self.assertTrue(collection.docs, "新版內文必須留著")
+        self.assertTrue(all(str(d["_id"]) in store.rows for d in collection.docs))
+
+    def test_pg_failure_rolls_back_mongo(self):
+        from main_pipeline import upload_to_mongodb
+
+        class FailingStore(FakeVectorStore):
+            def upsert(self, rows):
+                raise RuntimeError("模擬 PG 連線中斷")
+
+        collection = FakeCollection([])
+        new_count, write_failed = upload_to_mongodb(
+            [dict(self.ARTICLE)], collection,
+            vector_store=FailingStore(), embed_fn=fake_embed_ok)
+
+        self.assertEqual(new_count, 0)
+        self.assertTrue(write_failed, "PG 寫不進去要讓退出碼變 1")
+        self.assertEqual(collection.docs, [],
+                         "沒有向量的切片不能留在 Mongo——下次執行才會把整篇重來")
+
+    def test_job_without_vector_store_writes_nothing(self):
+        """PG 連不上就整批不寫，絕不退回把向量塞進 Atlas。"""
+        from main_pipeline import job
+
+        def unreachable():
+            raise RuntimeError("沒有設定 PGVECTOR_SYNC_DSN")
+
+        collection = FakeCollection([])
+        rc = job(fetchers=(lambda: TestHealthETLPipeline._all_source_articles(self),),
+                 collection_factory=lambda: collection,
+                 vector_store_factory=unreachable, embed_fn=fake_embed_ok)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(collection.docs, [])
+
+    def test_job_reconciles_and_closes_store(self):
+        from main_pipeline import job
+
+        collection = FakeCollection([])
+        store = FakeVectorStore({"孤兒": ([0.1], "錯誤")})
+        rc = job(fetchers=(lambda: TestHealthETLPipeline._all_source_articles(self),),
+                 collection_factory=lambda: collection,
+                 vector_store_factory=lambda: store, embed_fn=fake_embed_ok)
+
+        self.assertEqual(rc, 0)
+        self.assertNotIn("孤兒", store.rows, "ETL 結尾要把 PG 的孤兒向量清掉")
+        self.assertEqual(len(store.rows), len(collection.docs))
+        self.assertTrue(store.closed)
+
+    def test_reconcile_deletes_orphans_and_syncs_verdicts(self):
+        from bson import ObjectId
+        from vector_store import reconcile
+
+        tagged, plain = ObjectId(), ObjectId()
+        collection = FakeCollection([
+            {"_id": tagged, "verdict": "錯誤"},   # claim_tagger 事後補上的判定
+            {"_id": plain, "verdict": None},
+        ])
+        store = FakeVectorStore({
+            str(tagged): ([0.1], None),
+            str(plain): ([0.1], None),
+            "已刪的舊切片": ([0.1], None),
+        })
+
+        stats = reconcile(collection, store)
+
+        self.assertEqual(stats["orphans_deleted"], 1)
+        self.assertEqual(stats["verdicts_fixed"], 1)
+        self.assertEqual(store.all_verdicts(), {str(tagged): "錯誤", str(plain): None},
+                         "PG 的判定要照 Mongo 改——查核比對是在 PG 篩判定的")
+
+    def test_reconcile_treats_empty_verdict_as_none(self):
+        """Mongo 的空字串與 PG 的 NULL 是同一件事，不該每次都被當成要修。"""
+        from bson import ObjectId
+        from vector_store import reconcile
+
+        i = ObjectId()
+        store = FakeVectorStore({str(i): ([0.1], None)})
+        stats = reconcile(FakeCollection([{"_id": i, "verdict": ""}]), store)
+        self.assertEqual(stats["verdicts_fixed"], 0)
+
+    def test_reconcile_refuses_mass_delete(self):
+        """Mongo 查錯（空的、少一大半）時不能把整張表判成孤兒刪光——向量
+        只能重算，每天 1,000 次額度要兩個多星期。"""
+        from bson import ObjectId
+        from vector_store import reconcile
+
+        keep = ObjectId()
+        rows = {str(keep): ([0.1], None), "a": ([0.1], None), "b": ([0.1], None)}
+
+        store = FakeVectorStore(rows)
+        stats = reconcile(FakeCollection([{"_id": keep}]), store)
+        self.assertTrue(stats["refused"])
+        self.assertEqual(len(store.rows), 3, "孤兒超過一半就一筆都不刪")
+
+        store = FakeVectorStore(rows)
+        stats = reconcile(FakeCollection([]), store)
+        self.assertTrue(stats["refused"], "Mongo 查回空的，一定是查錯了")
+        self.assertEqual(len(store.rows), 3)
 
 
 if __name__ == '__main__':
@@ -1183,7 +1382,7 @@ class TestDailyQuotaExhaustion(unittest.TestCase):
                 raise DailyQuotaExhausted("quota")
             return [0.1] * 3072
 
-        upload_to_mongodb(articles, collection, embed_fn=embed_until_quota)
+        upload_to_mongodb(articles, collection, vector_store=FakeVectorStore(), embed_fn=embed_until_quota)
 
         # 額度用盡後不應再為後續文章呼叫 API
         self.assertLessEqual(calls["n"], 4,
@@ -1210,7 +1409,7 @@ class TestDailyQuotaExhaustion(unittest.TestCase):
             return [0.1] * 3072
 
         new_count, _ = upload_to_mongodb(articles, collection,
-                                         embed_fn=embed_second_fails)
+                                         vector_store=FakeVectorStore(), embed_fn=embed_second_fails)
 
         self.assertEqual(new_count, 1, "第一篇已完成，應照常寫入")
         urls = {d["url"] for d in collection.docs}
@@ -1398,7 +1597,7 @@ class TestChunkerVersioning(unittest.TestCase):
         article = {"source": "測試", "url": "https://example.tw/a", "title": "舊文",
                    "content": "第一句。第二句。", "updated_at": "2026-01-01"}
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
 
         self.assertTrue(collection.deleted_filters, "應刪除舊切片後重寫")
         self.assertTrue(collection.inserted_batches, "應寫入新切片")
@@ -1420,7 +1619,7 @@ class TestChunkerVersioning(unittest.TestCase):
                    "title": "無版本欄位", "content": "第一句。第二句。",
                    "updated_at": "2026-01-01"}
 
-        upload_to_mongodb([article], collection, embed_fn=fake_embed_ok)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=fake_embed_ok)
         self.assertTrue(collection.inserted_batches, "缺欄位應視為 v1 而重切")
 
     def test_same_chunker_version_does_not_rewrite(self):
@@ -1440,7 +1639,7 @@ class TestChunkerVersioning(unittest.TestCase):
         def must_not_embed(text):
             raise AssertionError("版本相同不應重新向量化")
 
-        upload_to_mongodb([article], collection, embed_fn=must_not_embed)
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(), embed_fn=must_not_embed)
         self.assertEqual(collection.inserted_batches, [])
 
 

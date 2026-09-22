@@ -4,6 +4,7 @@ import time
 import requests
 import schedule
 from dotenv import load_dotenv
+from bson import ObjectId
 from pymongo import MongoClient
 
 # 匯入我們自己寫好的爬蟲模組
@@ -14,11 +15,15 @@ from scraper_fda import get_fda_articles
 from scraper_mohw import get_mohw_articles
 from scraper_media import COLLECTION_NAME as MEDIA_COLLECTION_NAME, media_job
 from scraper_tfc import get_tfc_articles
+from vector_store import PgVectorStore, reconcile
 
 # 載入環境變數
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_URI")
+# 向量寫進 care-vm 的 pgvector（2026-09-19 從 Atlas 搬出，理由見 vector_store.py）。
+# 用可寫的 care_sync 帳號；CARE backend 用的 care_app 是唯讀的。
+PGVECTOR_DSN = os.getenv("PGVECTOR_SYNC_DSN")
 
 # 四個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
 # 任一來源本次一篇都沒抓到，就是異常——見 find_missing_sources 的說明。
@@ -213,8 +218,13 @@ def get_embedding(text: str, max_retries=3) -> list:
             time.sleep(5)
     return []
 
-def upload_to_mongodb(articles, collection, *, embed_fn=None):
-    """把文章切片、向量化後寫入 MongoDB。
+def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
+    """把文章切片、向量化後寫入：內文進 MongoDB，向量進 pgvector（`vector_store`）。
+
+    兩邊用同一個 id：切片的 `_id` 在這裡先產生，PG 那列的 id 就是它的字串形式。
+    寫入順序是 Mongo 先、PG 後，PG 失敗就把剛寫的 Mongo 切片清掉（走下面既有的
+    殘留清除），這篇留待下次重試——不留下「有內文沒向量」的切片。重寫時舊版切片的
+    向量也一併刪掉；哪一步失敗留下的孤兒，由 job() 結尾的 reconcile 收掉。
 
     寫入保證為「全有或全無」：一篇文章的所有 chunk 都成功取得向量才寫入，
     而且寫入中途失敗時會把殘留的切片清掉。任一環節失敗就整篇不留、留待下次
@@ -359,13 +369,13 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
             # 檢索的，判定必須跟著檢索結果一起回去，否則還要多一次查詢。
             docs = [
                 {
+                    "_id": ObjectId(),
                     "source_name": article["source"],
                     "url": url,
                     "original_title": title,
                     "chunk_content": chunk,
                     "chunk_index": i + 1,
                     "total_chunks": len(chunks),
-                    "embedding": vector,
                     "uploaded_at": time.time(),
                     "published_at": article.get("published_at"),
                     "updated_at": article.get("updated_at"),
@@ -374,13 +384,25 @@ def upload_to_mongodb(articles, collection, *, embed_fn=None):
                     "claim": article.get("claim"),
                     "chunker_version": CHUNKER_VERSION,
                 }
-                for i, (chunk, vector) in enumerate(zip(chunks, vectors))
+                for i, chunk in enumerate(chunks)
             ]
+            old_ids = []
             if needs_rewrite:
+                old_ids = [d["_id"] for d in collection.find({"url": url}, {"_id": 1})]
                 collection.delete_many({"url": url})
                 deleted_old = True
             insert_attempted = True
             collection.insert_many(docs)
+            vector_store.upsert(
+                [(doc["_id"], vector, doc["verdict"]) for doc, vector in zip(docs, vectors)])
+            # 舊版向量等新版兩邊都寫成功才刪，而且刪不掉不算這篇失敗：留下的只是
+            # 孤兒，job() 結尾的 reconcile 會再清一次；反過來先刪、刪失敗就中止，
+            # 會讓已經刪掉舊版內文的文章當天整篇消失。
+            if old_ids:
+                try:
+                    vector_store.delete_ids(old_ids)
+                except Exception as e:
+                    print(f"    ⚠️ 舊版向量刪除失敗，留給結尾對帳: {type(e).__name__}: {e}")
             print(f"    ✅ 成功寫入 {len(docs)} 個切片")
 
             # 讓同一批次內的重複文章也能被擋掉
@@ -438,6 +460,14 @@ def _default_collection():
     return client["CARE_database"]["health_articles_chunks"]
 
 
+def _default_vector_store():
+    """正式環境的向量庫。沒設 DSN 就直接失敗——不退回把向量寫進 Atlas，
+    那正是 2026-09-19 把免費層撐爆的做法。"""
+    if not PGVECTOR_DSN:
+        raise RuntimeError("沒有設定 PGVECTOR_SYNC_DSN")
+    return PgVectorStore(PGVECTOR_DSN)
+
+
 def _default_media_collection():
     """健康媒體的 collection。刻意不是 health_articles_chunks，理由見 scraper_media。"""
     client = MongoClient(MONGO_URI)
@@ -448,7 +478,8 @@ def run_media_job():
     return media_job(collection_factory=_default_media_collection)
 
 
-def job(*, fetchers=None, collection_factory=None, embed_fn=None):
+def job(*, fetchers=None, collection_factory=None, vector_store_factory=None,
+        embed_fn=None):
     """執行一次完整 ETL。回傳 0 表示正常，1 表示有來源全滅或寫入失敗。
 
     三個關鍵字參數是給測試用的依賴注入點，預設為正式環境的爬蟲模組、
@@ -464,6 +495,7 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
             lambda: get_cofacts_articles(test_mode=False),
         )
     collection_factory = collection_factory or _default_collection
+    vector_store_factory = vector_store_factory or _default_vector_store
 
     print(f"\n=== 🟢 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動正式爬蟲任務 ===")
     print("\n[階段一：呼叫爬蟲模組提取資料]")
@@ -486,10 +518,12 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
     # 一個來源的暫時問題不該阻擋另外兩個來源的正常更新（資料面 fail-open），
     # 但這次執行仍會以非零狀態碼結束（訊號面 fail-loud）。
     print("\n[階段二：切片與上傳]")
+    vector_store = None
     try:
         collection = collection_factory()
+        vector_store = vector_store_factory()
         total_new, write_failed = upload_to_mongodb(
-            all_articles, collection, embed_fn=embed_fn)
+            all_articles, collection, vector_store=vector_store, embed_fn=embed_fn)
         print(f"\n=== 🔴 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 任務結束！"
               f"成功寫入 {total_new} 篇文章（新增與改版合計） ===")
         if write_failed:
@@ -497,7 +531,7 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
             print("   本次執行將以非零狀態碼結束。")
             exit_code = 1
     except Exception as e:
-        print(f"❌ 嚴重：MongoDB 連線或上傳失敗: {e}")
+        print(f"❌ 嚴重：MongoDB／pgvector 連線或上傳失敗: {e}")
         print("   本次執行將以非零狀態碼結束。")
         exit_code = 1
 
@@ -518,13 +552,37 @@ def job(*, fetchers=None, collection_factory=None, embed_fn=None):
     except Exception as e:  # noqa: BLE001 - 加值步驟，不能影響 ETL 的結果
         print(f"  ⚠️ 補標籤失敗，略過（下次執行會再試）: {type(e).__name__}: {e}")
 
+    # 階段四：PG 與 Mongo 對帳。放在補標籤之後，讓剛補上的判定同一輪就進 PG——
+    # 查核比對是在 PG 篩判定的，只寫 Mongo 等於沒補。
+    #
+    # 失敗要讓退出碼變 1：跟補標籤不同，這一步沒做成的後果是檢索被孤兒佔名額、
+    # 查核看不到新判定，而且沒有其他地方會發現。
+    print("\n[階段四：向量庫對帳]")
+    if vector_store is None:
+        print("  跳過：向量庫沒有連上（上方已回報）")
+    else:
+        try:
+            stats = reconcile(collection_factory(), vector_store)
+            print(f"  Mongo {stats['mongo']} 個切片、PG {stats['pg']} 筆向量；"
+                  f"刪除孤兒 {stats['orphans_deleted']}／{stats['orphans']}、"
+                  f"修正判定 {stats['verdicts_fixed']}、沒有向量的切片 {stats['missing_vectors']}")
+            if stats["refused"]:
+                print(f"  ❌ 孤兒 {stats['orphans']} 筆超過 PG 的一半，判定為 Mongo 查詢異常，"
+                      "本次不刪。請確認 MONGO_URI 與 collection 名稱。")
+                exit_code = 1
+        except Exception as e:
+            print(f"  ❌ 對帳失敗: {type(e).__name__}: {e}")
+            exit_code = 1
+        finally:
+            vector_store.close()
+
     return exit_code
 
 def main(env=None, *, job_fn=None, media_job_fn=None):
     """環境偵測與退出碼決策。回傳要交給作業系統的退出碼。
 
-    GitHub Actions 會自帶 `GITHUB_ACTIONS=true`。在該模式下這是一次性執行，
-    直接回傳 `job()` 的退出碼讓 Actions 顯示紅燈；本機則是常駐排程，
+    `ETL_RUN_ONCE=1`（CARE-infra 的 care-etl CronJob 會設）是一次性執行，
+    直接回傳 `job()` 的退出碼讓 Job 標成失敗；本機則是常駐排程，
     先跑一次再進入迴圈，**刻意不因單次失敗終止程序**——開發時不該因為
     一次網路問題就讓排程死掉。
 
@@ -535,18 +593,14 @@ def main(env=None, *, job_fn=None, media_job_fn=None):
     job_fn = job_fn or job
     media_job_fn = media_job_fn or run_media_job
 
-    if env.get("GITHUB_ACTIONS") == "true":
-        print("☁️ 偵測到雲端 GitHub Actions 環境，啟動單次排程任務...")
+    if env.get("ETL_RUN_ONCE") == "1":
+        print("☁️ 單次執行模式（叢集 CronJob），啟動排程任務...")
         # 兩支都要跑完才決定退出碼：官方 ETL 失敗不該讓媒體當天沒更新，反之
-        # 亦然（資料面 fail-open）；但任一支失敗都要讓 Actions 顯示紅燈（訊號面
+        # 亦然（資料面 fail-open）；但任一支失敗都要讓 Job 標成失敗（訊號面
         # fail-loud）。與 job() 內「來源缺漏仍照常寫入其餘來源」同一個判斷。
         #
         # 媒體先跑：它只要十幾秒，官方要約一小時。每日推播在台北 09:00
         # （MEDICAL_NEWS_PUSH_TIME），媒體先寫入就不必排在官方後面等。
-        #
-        # 排程時間見 .github/workflows/etl_pipeline.yml：GitHub 的 cron 實測會延遲
-        # 約 2.5 小時觸發，原本 UTC 00:00（台北 08:00）的設定實際在台北 10:30
-        # 才開跑，當天抓的東西趕不上當天的推播。
         media_rc = media_job_fn()
         official_rc = job_fn()
         return 1 if (official_rc or media_rc) else 0

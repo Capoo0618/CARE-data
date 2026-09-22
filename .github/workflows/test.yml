@@ -1,0 +1,65 @@
+name: Test
+
+# ETL 本身不在這裡跑了：2026-09-22 起改由 CARE-infra 的 care-etl CronJob 在
+# care-vm 上每天執行，因為向量要直接寫叢集內的 pgvector（ClusterIP，GitHub
+# 的 runner 連不到）。理由見 vector_store.py。
+#
+# 這裡只跑單元測試。映像由 CARE-infra 從 main 的最新 commit build，
+# 所以壞掉的 commit 推上 main 就會被下一次部署帶上線——測試要在那之前擋住。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.16"
+          enable-cache: true
+
+      # --locked：uv.lock 與 pyproject.toml 不一致就讓 CI 失敗，而非默默重解版本
+      - name: Install Dependencies
+        run: uv sync --locked
+
+      - name: Run tests
+        run: uv run python -m unittest test_system
+
+  # 測試過了才通知 CARE-infra 重新 build care-etl 映像並部署（同 CARE／CARE-LIFF
+  # 的 trigger-deploy）。INFRA_DEPLOY_TOKEN 沒設時只留提示、不讓 CI 變紅：
+  # 其他 repo 觸發的部署也會取 CARE-data main 的最新版，只是會晚一點生效。
+  trigger-infra-deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token
+        id: token
+        env:
+          INFRA_DEPLOY_TOKEN: ${{ secrets.INFRA_DEPLOY_TOKEN }}
+        run: |
+          if [ -n "$INFRA_DEPLOY_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::沒有設定 INFRA_DEPLOY_TOKEN，這次不觸發部署；新版會在下一次 CARE-infra 部署時帶上線"
+          fi
+
+      - name: Dispatch deploy to CARE-infra
+        if: steps.token.outputs.present == 'true'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # tag v4.0.1
+        with:
+          token: ${{ secrets.INFRA_DEPLOY_TOKEN }}
+          repository: Yanagi-0912/CARE-infra
+          event-type: deploy
+          client-payload: |
+            {
+              "source": "data",
+              "ref": "main",
+              "sha": "${{ github.sha }}"
+            }
