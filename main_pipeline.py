@@ -565,7 +565,9 @@ def job(*, fetchers=None, collection_factory=None, vector_store_factory=None,
             stats = reconcile(collection_factory(), vector_store)
             print(f"  Mongo {stats['mongo']} 個切片、PG {stats['pg']} 筆向量；"
                   f"刪除孤兒 {stats['orphans_deleted']}／{stats['orphans']}、"
-                  f"修正判定 {stats['verdicts_fixed']}、沒有向量的切片 {stats['missing_vectors']}")
+                  f"修正判定 {stats['verdicts_fixed']}、"
+                  f"搬移向量 {stats['vectors_migrated']}、"
+                  f"沒有向量的切片 {stats['missing_vectors']}")
             if stats["refused"]:
                 print(f"  ❌ 孤兒 {stats['orphans']} 筆超過 PG 的一半，判定為 Mongo 查詢異常，"
                       "本次不刪。請確認 MONGO_URI 與 collection 名稱。")

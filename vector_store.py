@@ -103,14 +103,62 @@ class PgVectorStore:
                     f"UPDATE {self._table} SET verdict = %s WHERE id = %s", pairs)
 
 
+def _migrate_embeddings_from_mongo(collection, store, missing_ids, verdicts) -> int:
+    """把 Mongo 上自帶 `embedding` 的切片搬進 PG，成功後清掉 Mongo 的那份向量。
+
+    只處理呼叫端點名的那批 id，清除時也只清「這一批真的寫進 PG 的那些 id」，
+    不重新以 `{"embedding": {"$exists": True}}` 查一次——2026-09-19 手動搬移就是
+    這樣把匯出之後才寫進來、還沒進 PG 的 204 筆向量清掉的（見 CARE 的
+    scripts/sync_vectors_to_pg.py）。
+
+    一批寫 PG 失敗就跳過那一批（整批在同一交易裡回滾），Mongo 的向量原樣留著，
+    下一次對帳再試；不會出現「Mongo 清了但 PG 沒有」的狀態。
+    """
+    from bson import ObjectId
+
+    migrated = 0
+    for start in range(0, len(missing_ids), BATCH_SIZE):
+        batch = [ObjectId(i) for i in missing_ids[start:start + BATCH_SIZE]]
+        rows = [
+            (str(doc["_id"]), doc["embedding"], verdicts.get(str(doc["_id"])))
+            for doc in collection.find(
+                {"_id": {"$in": batch}, "embedding": {"$exists": True}},
+                {"_id": 1, "embedding": 1},
+            )
+            if doc.get("embedding")
+        ]
+        if not rows:
+            continue
+        try:
+            store.upsert(rows)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ⚠️ 搬移 {len(rows)} 筆向量失敗，留待下次對帳：{type(exc).__name__}: {exc}")
+            continue
+        collection.update_many(
+            {"_id": {"$in": [ObjectId(row[0]) for row in rows]}},
+            {"$unset": {"embedding": ""}},
+        )
+        migrated += len(rows)
+    return migrated
+
+
 def reconcile(collection, store, *, max_delete_ratio=MAX_ORPHAN_DELETE_RATIO):
     """讓 PG 與 Mongo 對齊：刪孤兒向量、同步判定。回傳統計 dict。
 
     Mongo 是準：內文、判定都以 Mongo 為主，PG 只是它的向量索引。所以方向永遠是
     「照 Mongo 改 PG」，從不反過來。
 
-    Mongo 有、PG 沒有的切片（沒有向量）只回報不處理：補救要重新向量化，那是
-    `upload_to_mongodb` 的工作，而且照現在的寫入順序不該發生。
+    Mongo 有、PG 沒有的切片分兩種：
+
+    - **Mongo 那筆自己帶著 `embedding`**：搬過來就好，不必重新向量化。CARE 後端
+      的知識回報收錄（admin 核准那條路）就是這樣寫的——後端雖然在叢集內，但它連
+      PG 用的 `care_app` 角色只有 SELECT，所以只能照舊把向量寫進 Atlas。過去有
+      `care-vector-sync` CronJob 每 6 小時搬，2026-09-22 ETL 搬進叢集後那支退役，
+      這條路就斷了：2026-09-23 核准收錄的 206 個切片沒有任何東西會把它們送進 PG，
+      只有 BM25 那條腿找得到。這裡把那座橋接回來。搬完就清掉 Mongo 上的
+      `embedding`——向量留在 Atlas 正是 512 MB 被撐爆的原因（見模組註解）。
+    - **連 `embedding` 都沒有**：只回報，不處理。補起來要重新向量化（要付錢），
+      那是 `upload_to_mongodb` 的工作，而且照現在的寫入順序不該發生。
     """
     mongo = {
         str(d["_id"]): d.get("verdict") or None
@@ -125,6 +173,7 @@ def reconcile(collection, store, *, max_delete_ratio=MAX_ORPHAN_DELETE_RATIO):
         "orphans": len(orphans),
         "orphans_deleted": 0,
         "missing_vectors": sum(1 for i in mongo if i not in pg),
+        "vectors_migrated": 0,
         "verdicts_fixed": 0,
         "refused": False,
     }
@@ -137,6 +186,15 @@ def reconcile(collection, store, *, max_delete_ratio=MAX_ORPHAN_DELETE_RATIO):
             for start in range(0, len(orphans), BATCH_SIZE):
                 store.delete_ids(orphans[start:start + BATCH_SIZE])
             stats["orphans_deleted"] = len(orphans)
+
+    missing = [i for i in mongo if i not in pg]
+    if missing:
+        stats["vectors_migrated"] = _migrate_embeddings_from_mongo(
+            collection, store, missing, mongo
+        )
+        # missing_vectors 報「這一輪之後仍然沒有向量的」，否則搬成功了還是照報
+        # 同一個數字，看報表的人分不出搬移有沒有生效。
+        stats["missing_vectors"] -= stats["vectors_migrated"]
 
     drift = [(i, mongo[i]) for i in pg if i in mongo and pg[i] != mongo[i]]
     for start in range(0, len(drift), BATCH_SIZE):

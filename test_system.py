@@ -13,6 +13,24 @@ import scraper_media
 import main_pipeline
 
 
+def _fake_matches(doc, filt) -> bool:
+    """FakeCollection 用的查詢比對：等值，外加 $in 與 $exists。
+
+    只實作正式程式碼真的會用到的那幾個運算子（vector_store 的向量搬移用
+    {"_id": {"$in": [...]}, "embedding": {"$exists": True}}）。不做成通用的
+    Mongo 模擬器：假物件愈像真的，愈容易掩蓋真正的差異。
+    """
+    for key, expected in filt.items():
+        if isinstance(expected, dict):
+            if "$in" in expected and doc.get(key) not in expected["$in"]:
+                return False
+            if "$exists" in expected and (key in doc) != expected["$exists"]:
+                return False
+        elif doc.get(key) != expected:
+            return False
+    return True
+
+
 class FakeCollection:
     """記錄呼叫的假 collection，讓寫入邏輯可在無網路下測試。"""
 
@@ -52,13 +70,16 @@ class FakeCollection:
                      if not all(d.get(k) == v for k, v in query.items())]
 
     def update_many(self, filt, update):
-        """只支援 {"url": ...} 條件與 $set —— 與 main_pipeline 實際用法一致。"""
-        url = filt.get("url")
+        """支援 {"url": ...} 與 {"_id": {"$in": [...]}} 條件、$set 與 $unset
+        —— 與 main_pipeline／vector_store 實際用法一致。"""
         changed = 0
         for doc in self.docs:
-            if doc.get("url") == url:
-                doc.update(update["$set"])
-                changed += 1
+            if not _fake_matches(doc, filt):
+                continue
+            doc.update(update.get("$set", {}))
+            for key in update.get("$unset", {}):
+                doc.pop(key, None)
+            changed += 1
         self.update_many_calls.append((filt, update))
         return changed
 
@@ -68,13 +89,13 @@ class FakeCollection:
         return sum(1 for doc in self.docs if doc.get("url") == url)
 
     def find(self, filt, projection=None):
-        """支援 {"url": ...} 與 {}（全部）—— 與 main_pipeline／reconcile 用法一致。
-        沒有 _id 的舊測資（手寫的既有文件）補一個，模擬 Mongo 的行為。"""
+        """支援 {"url": ...}、{}（全部）與 $in／$exists —— 與 main_pipeline／
+        reconcile 用法一致。沒有 _id 的舊測資（手寫的既有文件）補一個，
+        模擬 Mongo 的行為。"""
         from bson import ObjectId
         for doc in self.docs:
             doc.setdefault("_id", ObjectId())
-        return [d for d in self.docs
-                if all(d.get(k) == v for k, v in filt.items())]
+        return [d for d in self.docs if _fake_matches(d, filt)]
 
 
 class FakeVectorStore:
@@ -2255,3 +2276,65 @@ class TestCofactsPagination(unittest.TestCase):
 
         self.assertEqual(seen_after, [None, "c1", "c9"])
         self.assertEqual(len(rows), 3)
+
+
+class TestVectorBackfillFromMongo(unittest.TestCase):
+    """Mongo 自帶 embedding 的切片要被搬進 PG（知識回報收錄那條路）。"""
+
+    def test_reconcile_migrates_embeddings_written_by_the_backend(self):
+        from bson import ObjectId
+        from vector_store import reconcile
+
+        ingested, already = ObjectId(), ObjectId()
+        collection = FakeCollection([
+            # CARE 後端核准收錄時寫的：內文與 embedding 都在 Mongo，PG 沒有
+            {"_id": ingested, "verdict": None, "embedding": [0.2, 0.3]},
+            {"_id": already, "verdict": None},
+        ])
+        store = FakeVectorStore({str(already): ([0.1], None)})
+
+        stats = reconcile(collection, store)
+
+        self.assertEqual(stats["vectors_migrated"], 1)
+        self.assertEqual(stats["missing_vectors"], 0, "搬完就不該再報成缺向量")
+        self.assertEqual(store.rows[str(ingested)][0], [0.2, 0.3])
+        self.assertNotIn("embedding", collection.docs[0],
+                         "搬完要清掉 Mongo 的向量——留著正是 Atlas 512MB 被撐爆的原因")
+
+    def test_chunks_without_embedding_are_only_reported(self):
+        """沒有向量的切片要重新向量化才補得起來，那要付錢，不在對帳做。"""
+        from bson import ObjectId
+        from vector_store import reconcile
+
+        i = ObjectId()
+        store = FakeVectorStore({"其他": ([0.1], None)})
+        stats = reconcile(FakeCollection([{"_id": i, "verdict": None}]), store)
+        self.assertEqual(stats["vectors_migrated"], 0)
+        self.assertEqual(stats["missing_vectors"], 1)
+
+    def test_failed_write_keeps_the_mongo_copy(self):
+        """PG 寫失敗時 Mongo 的向量要原樣留著，下一次對帳再試。"""
+        from bson import ObjectId
+        from vector_store import reconcile
+
+        class _FailingStore(FakeVectorStore):
+            def upsert(self, rows):
+                raise RuntimeError("PG 連不上")
+
+        i = ObjectId()
+        collection = FakeCollection([{"_id": i, "verdict": None, "embedding": [0.2]}])
+        stats = reconcile(collection, _FailingStore({"其他": ([0.1], None)}))
+
+        self.assertEqual(stats["vectors_migrated"], 0)
+        self.assertEqual(collection.docs[0]["embedding"], [0.2])
+
+    def test_verdict_travels_with_the_migrated_vector(self):
+        """查核比對是在 PG 以 verdict 篩的，搬過去沒帶判定等於沒收錄。"""
+        from bson import ObjectId
+        from vector_store import reconcile
+
+        i = ObjectId()
+        collection = FakeCollection([{"_id": i, "verdict": "錯誤", "embedding": [0.5]}])
+        store = FakeVectorStore({"其他": ([0.1], None)})
+        reconcile(collection, store)
+        self.assertEqual(store.rows[str(i)][1], "錯誤")
