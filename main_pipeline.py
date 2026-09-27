@@ -261,23 +261,86 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
             url = article.get("url")
             title = article["title"]
 
-            # 決定這一篇要不要重寫。兩種情形會重寫：
-            #   (a) 既有切片數與宣告的 total_chunks 不符——破洞，修復它
-            #   (b) 來源提供的修改日期與庫中不同——改版
+            # 決定這一篇要不要重寫。三種情形會重寫：
+            #   (a) 切法換版——舊切片的邊界是錯的，見下方 (c) 的註解
+            #   (b) 既有切片數與宣告的 total_chunks 不符——破洞，修復它
+            #   (c) 來源提供的修改日期與庫中不同——改版
+            # 中繼資料（日期、判定標籤）的補寫不在這三種之內：那只是一次
+            # Mongo 寫入，與要不要重算向量是兩回事，見下方獨立的那一支。
             # 刻意不用內容雜湊比對：那會讓每次清洗邏輯微調都觸發全量重寫。
             # 這裡只做判定，實際刪除延後到 insert_many 之前（見下方），
             # 確保「刪掉舊版卻寫不出新版」這種資料遺失不會發生。
             incoming_updated = article.get("updated_at")
             needs_rewrite = False
+            # 既有文章的比對鍵：有網址用網址，沒有的用標題。
+            #
+            # 以前這裡是 `if url else None`——沒有網址就整個比對區塊跳過。
+            # 食藥署那個 DataAction feed **結構上不提供文章網址**（見
+            # scraper_api.get_api_articles 的說明），它的 582 篇文章因此從來
+            # 沒有進過這個區塊：補日期、補判定標籤、修破洞、換切法，四種自癒
+            # 機制一個都碰不到它們，永遠停在第一次寫入時的樣子。線上實測
+            # （2026-09-27）：1,145 個切片沒有 published_at、chunker_version
+            # 仍是第一版，而全庫其餘 15,353 個切片都已經是第二版。
+            #
+            # 標題當鍵是安全的：下面「已存在就跳過」本來就在用
+            # `title in existing_titles` 判定同一篇，這裡只是讓比對鍵與去重鍵
+            # 一致。實測無網址的文章跨來源撞名 0 筆。
+            match = {"url": url} if url else {"url": None, "original_title": title}
             old = collection.find_one(
-                {"url": url},
-                {"updated_at": 1, "total_chunks": 1, "chunker_version": 1},
-            ) if url else None
+                match,
+                {"updated_at": 1, "published_at": 1, "total_chunks": 1,
+                 "chunker_version": 1},
+            )
             if old is not None:
                 declared = old.get("total_chunks")
-                actual = collection.count_documents({"url": url})
+                # 必須用 match 而不是 {"url": url}：url 為 None 時後者會數到
+                # 全部沒有網址的文章（線上 1,145 個切片），每一篇都會被判成
+                # 「破洞」而整批重算向量。
+                actual = collection.count_documents(match)
                 old_updated = old.get("updated_at")
                 old_chunker = old.get("chunker_version", 1)
+
+                # 中繼資料先補，而且**不參與**下面的重寫判定。
+                #
+                # 補資料只是一次 Mongo 寫入，重算向量才是昂貴的那件事。以前
+                # 兩者綁在同一條 elif 鏈上，切法換版的那一輪會蓋掉補資料——
+                # 而那一輪若遇到 embedding 配額用盡（DailyQuotaExhausted），
+                # 這一篇會整個跳過，日期也跟著沒補到，下一輪再重複一次。拆開
+                # 之後，日期在第一輪就落地，重算成不成功都不影響它。
+                #
+                # 觸發條件有兩種：
+                #   (1) 來源有修改日期而庫中沒有——本次變更之前寫入的。
+                #   (2) 來源有發布日期而庫中沒有。第二種是後補的：原本整支的
+                #       前提是「有修改日期可比對」，但食藥署公告與國健署真相
+                #       與闢謠這兩個來源**結構上就沒有修改日期**（見
+                #       scraper_api、scraper_mohw 的註解），第一個條件對它們
+                #       永遠是 False，發布日期也就永遠補不上。
+                #
+                # 完整的既有文章只補中繼資料、不重新向量化：把「沒有日期」當成
+                # 「日期不同」會讓合併後首次執行重算全部既有切片（衛福部 2,840
+                # 個，每個切片有 2 秒節流，實際要跑數小時且極可能耗盡 Gemini
+                # 配額），換來的只是內容多半相同的重算。補上日期之後，之後每一
+                # 次真正的改版都能正常偵測。代價：若某篇在本次變更之前就已於
+                # 來源改版，那一次改版會被漏掉。這是一次性且有界的，遠低於全量
+                # 重算的成本。
+                #
+                # verdict／claim 一併補上：它們是中繼資料，跟切片內容無關，
+                # 不補的話既有的 TFC 文章會永遠沒有判定標籤。
+                if (incoming_updated and old_updated is None) or (
+                    article.get("published_at") and old.get("published_at") is None
+                ):
+                    collection.update_many(
+                        match,
+                        {"$set": {
+                            "published_at": article.get("published_at"),
+                            "updated_at": incoming_updated,
+                            "verdict": article.get("verdict"),
+                            "verdict_slug": article.get("verdict_slug"),
+                            "claim": article.get("claim"),
+                        }},
+                    )
+                    print(f"  📌 補上日期欄位（既有資料，不重算向量）: {title[:15]}...")
+
                 if old_chunker != CHUNKER_VERSION:
                     # (c) 切法換了。舊版是不看標點的字元硬切，切片從句子中間
                     # 斷開，語意殘缺的片段直接進向量空間、也直接被下游拿去
@@ -294,36 +357,14 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
                     print(f"  🔧 既有文章不完整（宣告 {declared} 塊、"
                           f"實際 {actual} 塊），將重寫修復: {title[:15]}...")
                     needs_rewrite = True
-                elif incoming_updated and old_updated is None:
-                    # 注意優先序：上面的切法版本檢查排在這一支之前，因此切法
-                    # 換版的那一輪，這個「只補日期不重算」的優化會被蓋過。那是
-                    # 刻意的——切片邊界錯了就沒有「不重算」的餘地，而優化本來
-                    # 就是為了避免「無意義」的重算。等全部重切完成之後，這一支
-                    # 才會恢復作用。
-                    #
-                    # 這一篇是本次變更之前寫入的，沒有日期可比對。
-                    # 完整的既有文章只補中繼資料、不重新向量化：把「沒有日期」
-                    # 當成「日期不同」會讓合併後首次執行重算全部既有切片
-                    # （衛福部 2,840 個，每個切片有 2 秒節流，實際要跑數小時
-                    # 且極可能耗盡 Gemini 配額），換來的只是內容多半相同的重算。
-                    # 補上日期之後，之後每一次真正的改版都能正常偵測。
-                    # 代價：若某篇在本次變更之前就已於來源改版，那一次改版會被
-                    # 漏掉。這是一次性且有界的，遠低於全量重算的成本。
-                    # verdict／claim 一併補上：它們是中繼資料，跟切片內容無關，
-                    # 不補的話既有的 TFC 文章會永遠沒有判定標籤——這一支只在
-                    # 「已存在」時執行，之後再也不會有機會回頭寫。
-                    collection.update_many(
-                        {"url": url},
-                        {"$set": {
-                            "published_at": article.get("published_at"),
-                            "updated_at": incoming_updated,
-                            "verdict": article.get("verdict"),
-                            "verdict_slug": article.get("verdict_slug"),
-                            "claim": article.get("claim"),
-                        }},
-                    )
-                    print(f"  📌 補上日期欄位（既有資料，不重算向量）: {title[:15]}...")
-                elif incoming_updated and old_updated != incoming_updated:
+                elif (incoming_updated and old_updated is not None
+                      and old_updated != incoming_updated):
+                    # `old_updated is not None` 這個條件不可省：庫中沒有日期
+                    # 代表「這篇是補日期機制上線之前寫入的」，不是「來源改版
+                    # 了」。兩者以前靠 elif 的順序區分——補日期那一支排在前面
+                    # 就接走了——現在補日期獨立出去，這裡必須自己講清楚，否則
+                    # 每一篇尚未補過日期的舊文章都會被當成改版而重算向量
+                    # （衛福部就有 2,840 個切片）。
                     print(f"  🔄 偵測到改版，將重寫: {title[:15]}...")
                     needs_rewrite = True
 
@@ -388,8 +429,10 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
             ]
             old_ids = []
             if needs_rewrite:
-                old_ids = [d["_id"] for d in collection.find({"url": url}, {"_id": 1})]
-                collection.delete_many({"url": url})
+                # 同樣用 match：`{"url": None}` 會比對到**全部**沒有網址的
+                # 文章，拿它當刪除條件等於一篇重寫就清掉整個食藥署公告來源。
+                old_ids = [d["_id"] for d in collection.find(match, {"_id": 1})]
+                collection.delete_many(match)
                 deleted_old = True
             insert_attempted = True
             collection.insert_many(docs)

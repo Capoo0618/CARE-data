@@ -84,9 +84,13 @@ class FakeCollection:
         return changed
 
     def count_documents(self, filt):
-        """只支援 {"url": ...} 條件 —— 與 main_pipeline 實際用法一致。"""
-        url = filt.get("url")
-        return sum(1 for doc in self.docs if doc.get("url") == url)
+        """比對 filt 的每一個欄位 —— 與 main_pipeline 實際用法一致。
+
+        以前只看 `url`。main_pipeline 改成「沒有網址就用標題當比對鍵」之後，
+        只看 url 的假物件會把所有無網址的文章數成同一篇，正好掩蓋掉這個改動
+        最危險的失誤（把整個來源當成一篇的破洞去重寫）。
+        """
+        return sum(1 for doc in self.docs if _fake_matches(doc, filt))
 
     def find(self, filt, projection=None):
         """支援 {"url": ...}、{}（全部）與 $in／$exists —— 與 main_pipeline／
@@ -399,7 +403,10 @@ class TestHealthETLPipeline(unittest.TestCase):
         from main_pipeline import upload_to_mongodb
 
         collection = FakeCollection(existing=[
-            {"url": None, "original_title": "已存在的文章"},
+            # 切法版本要寫成現行版：沒有網址的文章現在也會進切法檢查，
+            # 缺這個欄位就會被判成舊切法而重寫，測不到這裡要測的去重。
+            {"url": None, "original_title": "已存在的文章",
+             "chunker_version": _CURRENT_CHUNKER},
         ])
         articles = [
             {"title": "已存在的文章", "content": "內容。", "source": "食藥署闢謠專區", "url": None},
@@ -747,6 +754,102 @@ class TestHealthETLPipeline(unittest.TestCase):
         self.assertEqual(len(collection.docs), 2)
         self.assertTrue(all(d["updated_at"] == "2024/03/15" for d in collection.docs),
                         "所有切片都要補上日期")
+
+    def _urlless_pair(self):
+        """兩篇沒有網址、且都還沒補日期的既有文章（食藥署公告的形態）。"""
+        return FakeCollection([
+            {"url": None, "original_title": "甲文章", "chunk_content": "甲一",
+             "chunk_index": 1, "total_chunks": 1, "embedding": [0.1],
+             "chunker_version": _CURRENT_CHUNKER},
+            {"url": None, "original_title": "乙文章", "chunk_content": "乙一",
+             "chunk_index": 1, "total_chunks": 1, "embedding": [0.1],
+             "chunker_version": _CURRENT_CHUNKER},
+        ])
+
+    def test_18a_article_without_url_is_matched_by_title_and_backfilled(self):
+        """沒有網址的來源也要補得到日期。
+
+        食藥署那個 DataAction feed 結構上不提供文章網址，比對鍵以前寫死
+        `{"url": url}` 且 url 為 None 就整個跳過，那批文章因此永遠補不到
+        發布日期（線上 1,145 個切片）。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = self._urlless_pair()
+        article = {
+            "source": "食藥署公告", "url": None, "title": "甲文章",
+            "content": "新內容", "published_at": "2024/01/01",
+            # 這個來源沒有「修改日期」，所以 updated_at 恆為 None——
+            # 補日期的判斷不能以它為前提。
+            "updated_at": None,
+        }
+
+        calls = []
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(),
+                          embed_fn=lambda text: calls.append(text) or [0.5] * 3072)
+
+        self.assertEqual(calls, [], "完整的既有文章不應重新向量化")
+        self.assertEqual(collection.deleted_filters, [], "不應刪除任何切片")
+        甲 = [d for d in collection.docs if d["original_title"] == "甲文章"]
+        乙 = [d for d in collection.docs if d["original_title"] == "乙文章"]
+        self.assertEqual([d.get("published_at") for d in 甲], ["2024/01/01"])
+        self.assertEqual([d.get("published_at") for d in 乙], [None],
+                         "另一篇沒有網址的文章不該被一起改到")
+
+    def test_18b_urlless_rewrite_only_touches_that_one_article(self):
+        """沒有網址時的重寫，刪除條件必須限縮到該篇。
+
+        `{"url": None}` 會比對到**全部**沒有網址的文章。拿它當刪除條件，
+        一篇重寫就會清掉整個來源；拿它當 count_documents 的條件，則每一篇
+        都會被判成「宣告 1 塊、實際 N 塊」的破洞而整批重算向量。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = self._urlless_pair()
+        # 甲文章宣告 2 塊但只有 1 塊：真正的破洞，該重寫
+        collection.docs[0]["total_chunks"] = 2
+        article = {
+            "source": "食藥署公告", "url": None, "title": "甲文章",
+            "content": "新內容", "published_at": "2024/01/01", "updated_at": None,
+        }
+
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(),
+                          embed_fn=fake_embed_ok)
+
+        self.assertEqual(len(collection.deleted_filters), 1)
+        self.assertEqual(collection.deleted_filters[0],
+                         {"url": None, "original_title": "甲文章"},
+                         "刪除條件必須指名這一篇")
+        self.assertTrue(
+            any(d["original_title"] == "乙文章" for d in collection.docs),
+            "另一篇沒有網址的文章不該被刪掉")
+
+    def test_18c_backfill_survives_a_rewrite_that_never_happens(self):
+        """切法換版那一輪若向量化失敗，日期仍然要補上。
+
+        補資料只是一次 Mongo 寫入，與要不要重算向量是兩回事。以前兩者綁在
+        同一條 elif 鏈上，切法換版會蓋掉補資料，而那一輪配額用盡就整篇跳過，
+        日期也跟著沒補到——下一輪再重複一次，永遠補不上。
+        """
+        from main_pipeline import upload_to_mongodb
+
+        collection = FakeCollection([
+            {"url": "https://example.tw/a", "original_title": "舊切法文章",
+             "chunk_content": "整篇", "chunk_index": 1, "total_chunks": 1,
+             "embedding": [0.1], "chunker_version": _CURRENT_CHUNKER - 1},
+        ])
+        article = {
+            "source": "國健署真相與闢謠", "url": "https://example.tw/a",
+            "title": "舊切法文章", "content": "新內容",
+            "published_at": "2024/01/01", "updated_at": None,
+        }
+
+        upload_to_mongodb([article], collection, vector_store=FakeVectorStore(),
+                          embed_fn=lambda text: None)  # 向量化全數失敗
+
+        self.assertTrue(all(d.get("published_at") == "2024/01/01"
+                            for d in collection.docs),
+                        "重算沒成功，日期仍然要留在庫裡")
 
     def test_19_repair_with_embedding_failure_does_not_delete_old_version(self):
         """破洞修復重寫時若向量化失敗，不得刪除舊版本（避免資料遺失）。
