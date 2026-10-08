@@ -10,6 +10,7 @@ from pymongo import MongoClient
 # 匯入我們自己寫好的爬蟲模組
 from claim_tagger import tag_untagged
 from scraper_api import get_api_articles
+from scraper_cdc import get_cdc_articles
 from scraper_cofacts import get_cofacts_articles
 from scraper_fda import get_fda_articles
 from scraper_mohw import get_mohw_articles
@@ -25,7 +26,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 # 用可寫的 care_sync 帳號；CARE backend 用的 care_app 是唯讀的。
 PGVECTOR_DSN = os.getenv("PGVECTOR_SYNC_DSN")
 
-# 四個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
+# 必須監測的來源正式名稱，與各爬蟲模組回傳的 source 欄位一致。
 # 任一來源本次一篇都沒抓到，就是異常——見 find_missing_sources 的說明。
 #
 # 命名原則：**來源名必須與實際發布機關一致**。這個欄位不是內部識別碼，它會
@@ -55,6 +56,8 @@ EXPECTED_SOURCES = frozenset({
     # 其他來源：它是目前涵蓋民眾實際轉傳訊息最廣的一批，一篇都沒有代表 API
     # 掛了或品質門檻寫壞了，不該無聲通過。
     "Cofacts 真的假的",
+    # 一般衛教，與 scraper_mohw 的「疾管署闢謠專區」是不同來源。
+    "疾管署疾病介紹",
     # 「疾管署闢謠專區」刻意**不**列入：那 24 筆全部是 110 年 COVID 時期的
     # 舊文，站方已多年沒有新增。
     #
@@ -536,6 +539,7 @@ def job(*, fetchers=None, collection_factory=None, vector_store_factory=None,
             lambda: get_tfc_articles(test_mode=False),
             lambda: get_mohw_articles(test_mode=False),
             lambda: get_cofacts_articles(test_mode=False),
+            lambda: get_cdc_articles(test_mode=False),
         )
     collection_factory = collection_factory or _default_collection
     vector_store_factory = vector_store_factory or _default_vector_store

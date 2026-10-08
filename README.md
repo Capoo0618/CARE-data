@@ -4,7 +4,7 @@
 
 本專案採用 **Microservices（微服務）架構**，將對外提供即時服務的 LINE Bot 與耗時的資料蒐集、清洗、向量化流程完全解耦。
 
-系統每日自動從政府公開 API 與台灣事實查核中心（TFC）取得最新健康闢謠文章，經過 NLP 切片、Gemini Embedding 向量化後，內文寫入 MongoDB、向量寫入 care-vm 上的 pgvector，提供前端 Bot 作為 Retrieval-Augmented Generation（RAG）的知識庫。
+系統每日自動從政府公開 API、疾管署疾病介紹與查核來源取得健康闢謠和一般衛教文章，經過 NLP 切片、Gemini Embedding 向量化後，內文寫入 MongoDB、向量寫入 care-vm 上的 pgvector，提供前端 Bot 作為 Retrieval-Augmented Generation（RAG）的知識庫。
 
 ## 資料來源
 
@@ -17,6 +17,50 @@
 | 衛福部真相說明 | `scraper_mohw.py` | 爬 `lp-4343-1.html` 彙整頁 | ✅ | ❌ | ❌ | ✅ 正常 |
 | 國健署真相與闢謠 | `scraper_mohw.py` | 同上，連結指向 `hpa.gov.tw` | ✅ | ❌ | ❌ | ✅ 正常 |
 | 疾管署闢謠專區 | `scraper_mohw.py` | 同上，連結指向 `cdc.gov.tw` | ✅ | ❌ | ❌ | ⚠️ 停在 110 年 |
+| 疾管署疾病介紹 | `scraper_cdc.py` | 官方傳染病索引 → 疾病專頁 → 中文疾病介紹 | ✅ | ✅ 最後更新日期（有提供時） | ❌ 一般衛教不做查核標記 | 每次重抓，由 ETL 監測空來源 |
+
+### 一般健康衛教：疾管署疾病介紹（第一階段）
+
+入口為 [疾管署傳染病介紹](https://www.cdc.gov.tw/Disease/Index)。爬蟲每日重新探索
+索引中的疾病專頁，只跟隨「疾病資訊」區的「疾病介紹」卡片，收錄介紹正文中的
+致病原、傳播方式、症狀與預防衛教等文字。第一階段不擴抓新聞、疫情統計、Q&A、
+教材、PDF／圖片附件或外站，也不將疾病專頁的摘要當成介紹正文。
+
+- `source` 固定為 **疾管署疾病介紹**；標題為 `<疾病名稱>－疾病介紹`，避免各頁都叫
+  「疾病介紹」而被既有標題去重機制當成同一篇。引用網址指向官方介紹明細頁。
+- 只取文章正文容器，剝除 script／style；保留段落、列表與表格文字供既有 chunker
+  切片。側欄、分享／短網址控制項、日期與頁尾不進入向量化。
+- 明確標示的發布／最後更新日期正規化為 `YYYY-MM-DD`（包含民國日期轉換）；
+  缺漏或非法日期保留 `None`，不把更新日、抓取日或頁尾日期當成發布日。
+- 以正規化的官方明細 URL 去重（移除查詢追蹤參數與 fragment）。有更新日期時，
+  沿用 ETL 的改版替換；未改版不重新向量化。缺少更新日期時沿用「已存在即跳過」
+  的限制；站方若未更新日期，正文變更也無法被偵測。
+- `claim`／`verdict`／`verdict_slug` 入庫為 `None`，不加入 `claim_tagger.SOURCES`。
+  它是一般衛教來源，與從衛福部真相說明彙整頁取得的 **疾管署闢謠專區** 分開。
+- 內文仍寫入 `CARE_database.health_articles_chunks`，向量仍寫入 PostgreSQL
+  `health_articles_chunks`，PG `id` 對應 Mongo `_id`。沿用全篇向量化成功才寫入、
+  寫入失敗清除殘留、每日額度接續與結尾對帳，無需 schema 遷移或重建既有向量。
+  `daily_health_news` 是媒體推播資料，不是本來源的寫入目標。
+- TLS 驗證沿用 `get_ca_bundle()`，每次請求逾時 25 秒、間隔 0.4 秒；連線／逾時／
+  HTTP 429／5xx 使用既有 3 次重試與 2／5 秒退避。單篇失敗記錄網址並繼續，
+  抓取失敗不刪除既有資料。整個來源零產出由 `EXPECTED_SOURCES` 讓 ETL 回傳 1，
+  其餘來源仍正常寫入。
+
+首次收錄使用既有 embedding 額度限制，可能分多個排程週期完成。測試與爬蟲預覽
+不呼叫 Gemini，也不寫入正式資料庫：
+
+```bash
+# 離線：固定 HTML 與注入假件，涵蓋解析、來源失效、兩邊寫入、重跑與改版
+uv run python -m unittest test_system.TestCDCDiseaseScraper test_system.TestCDCDiseaseIntegration -v
+# 線上：與官方索引及介紹正文動態比對
+uv run python -m unittest test_system.TestCDCDiseaseLive -v
+# 預覽：只抓最多 3 篇，列出標題／更新日／網址
+uv run python scraper_cdc.py
+```
+
+HTML fixtures 位於 `tests/fixtures/cdc/`，依官方 DOM 精簡並使用測試文字。完整測試
+保留既有各來源的動態一致性驗證。本文或註解中的歷史量測篇數，不代表目前資料庫
+實況；本次開發未查詢正式資料庫篇數。
 
 `scraper_mohw.py` 爬的是衛福部「真相說明」——一個**跨機關的彙整頁**，本身不放
 內文，每一列連到發布機關自己的網站。因此它一支爬蟲產出三個來源名：來源名必須
@@ -130,7 +174,7 @@ TFC 是四個來源裡唯一本來就在做查核的——其餘三個是政府�
 
 ETL 在以下情況會以**非零狀態碼**結束，讓 CronJob 的 Job 標成失敗：
 
-- 四個來源中有任一個本次完全沒有取得文章（爬蟲失效、來源改版、網路或憑證問題）
+- `EXPECTED_SOURCES` 列出的任一來源本次完全沒有取得文章（爬蟲失效、來源改版、網路或憑證問題）
 - 知識庫寫入階段失敗（Mongo 或 pgvector 任一邊）
 - 向量庫對帳失敗，或孤兒超過 PG 的一半而拒絕刪除（多半是 Mongo 查錯了）
 
@@ -167,10 +211,12 @@ CARE-data/
 ├── Dockerfile                    # care-etl 映像（CARE-infra 的 cicd build）
 ├── scraper_api.py                # 政府 API 爬蟲（食藥署公告、衛福部）
 ├── scraper_fda.py                # 食藥署闢謠專區網頁爬蟲
+├── scraper_cdc.py                # 疾管署疾病介紹與正文中的預防衛教
 ├── scraper_tfc.py                # 台灣事實查核中心爬蟲
 ├── ca_bundle.py                  # TLS 憑證鏈：certifi 根憑證庫 + 釘選的中繼憑證
 ├── utils.py                      # 共用工具（HTML 清洗等）
 ├── test_system.py                # 單元測試與資料一致性驗證
+├── tests/fixtures/cdc/           # 疾管署 HTML 解析離線測資
 ├── pyproject.toml                # Python 套件（uv 管理）
 ├── uv.lock                       # 相依鎖定（含傳遞相依，須進版控）
 ├── .gitignore
@@ -182,7 +228,7 @@ CARE-data/
 # ETL 流程
 
 ```text
-政府 API / TFC
+政府 API / 疾管署疾病介紹 / 查核來源
         │
         ▼
     爬蟲取得文章
@@ -197,7 +243,7 @@ CARE-data/
  Gemini Embedding
         │
         ▼
-    MongoDB
+    MongoDB（內文）+ pgvector（向量，同一切片 ID）
         │
         ▼
 LINE Bot (RAG)
@@ -246,7 +292,12 @@ uv sync                                            # 建 .venv 並照 uv.lock �
 
 ```bash
 uv run python test_system.py
+# 與 CI 相同的載入方式；兩種指令都會執行所有測試類別
+uv run python -m unittest test_system
 ```
+
+完整測試包含對官方來源的線上動態一致性驗證，需要網路；MongoDB、pgvector 與
+Gemini 的寫入測試使用依賴注入假件。CDC 的純離線指令見上方來源說明。
 
 ---
 
@@ -300,11 +351,11 @@ kubectl logs -n care-dev -f job/<上面建立的名稱>
 
 本專案專注於 **資料蒐集（ETL）**，負責：
 
-- 爬取健康闢謠資料
+- 爬取健康闢謠與一般衛教資料
 - 清洗與格式化內容
 - NLP 文字切片
 - 向量化（Embedding）
-- 寫入 MongoDB
+- 內文寫入 MongoDB、向量寫入 pgvector，並對帳切片 ID 與判定
 
 前端 **LINE Bot** 則負責：
 
@@ -312,4 +363,4 @@ kubectl logs -n care-dev -f job/<上面建立的名稱>
 - RAG 檢索
 - Gemini 回答生成
 
-兩者透過 MongoDB 完全解耦，可獨立部署與維護。
+兩者透過 MongoDB 與 pgvector 的既有資料契約解耦，可獨立部署與維護。
