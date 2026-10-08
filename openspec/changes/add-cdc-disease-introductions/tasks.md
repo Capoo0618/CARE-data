@@ -22,6 +22,8 @@
 - [x] 完成唯讀程式審查：核對官方 DOM、既有資料契約與新增測試，無重要問題。
 - [x] commit、推送 `feat/cdc-disease-education`，建立 [PR #10](https://github.com/Capoo0618/CARE-data/pull/10)。
   合併後由維護者 archive 本變更。
+- [x] 依後續指示完成單篇試匯入與全來源增量入庫，獨立核對兩邊資料與五個疾病 RAG
+  問句；結果見 [正式入庫驗證](ingestion-verification.md)。
 
 ## 驗證紀錄（2026-10-08）
 

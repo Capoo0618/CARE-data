@@ -59,8 +59,9 @@ uv run python scraper_cdc.py
 ```
 
 HTML fixtures 位於 `tests/fixtures/cdc/`，依官方 DOM 精簡並使用測試文字。完整測試
-保留既有各來源的動態一致性驗證。本文或註解中的歷史量測篇數，不代表目前資料庫
-實況；本次開發未查詢正式資料庫篇數。
+保留既有各來源的動態一致性驗證。2026-10-08 依使用者指示完成初次全來源入庫及
+正式 RAG 檢索抽測，結果見 [正式入庫驗證](openspec/changes/add-cdc-disease-introductions/ingestion-verification.md)。
+本文或註解中的歷史量測篇數，不代表目前資料庫實況。
 
 `scraper_mohw.py` 爬的是衛福部「真相說明」——一個**跨機關的彙整頁**，本身不放
 內文，每一列連到發布機關自己的網站。因此它一支爬蟲產出三個來源名：來源名必須
