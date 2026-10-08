@@ -20,7 +20,8 @@
 - [x] Python 3.10 全套 `python test_system.py` 與 `python -m unittest test_system` 通過，
   含 `TestCDCDiseaseLive.test_live_index_and_first_three_introductions` 動態驗證。
 - [x] 完成唯讀程式審查：核對官方 DOM、既有資料契約與新增測試，無重要問題。
-- [ ] commit、推送 feature branch 與建立 PR；合併後由維護者 archive 本變更。
+- [x] commit、推送 `feat/cdc-disease-education`，建立 [PR #10](https://github.com/Capoo0618/CARE-data/pull/10)。
+  合併後由維護者 archive 本變更。
 
 ## 驗證紀錄（2026-10-08）
 
