@@ -1,0 +1,101 @@
+"""來源限定入庫工具：離線 DB／embedding 假件。"""
+import unittest
+from unittest.mock import Mock
+from test_system import FakeCollection, FakeVectorStore
+from test_education import FIXTURES
+
+
+class TestEducationIngest(unittest.TestCase):
+    def article(self):
+        from scraper_education import parse_article, SOURCES
+        return parse_article('ecdc', (FIXTURES / 'ecdc-detail.html').read_text(), SOURCES['ecdc']['sample_url'])
+
+    def test_write_repeats_without_embedding_and_reports_metadata(self):
+        from ingest_education import ingest_batch
+        c = FakeCollection([]); s = FakeVectorStore(); a = self.article()
+        embed = Mock(return_value=[0.01] * 3072)
+        report = ingest_batch([a], c, s, embed_fn=embed, max_embedding_calls=10)
+        self.assertEqual(report['new_or_rewritten_articles'], 1)
+        self.assertEqual(report['embedding_calls'], 1)
+        embed.reset_mock()
+        report = ingest_batch([a], c, s, embed_fn=embed, max_embedding_calls=10)
+        self.assertEqual(report['new_or_rewritten_articles'], 0)
+        embed.assert_not_called()
+        self.assertTrue(all(d['attribution'] == a['attribution'] for d in c.docs))
+
+    def test_invalid_source_or_license_rejected_before_embedding(self):
+        from ingest_education import ingest_batch
+        for a in [dict(self.article(), license='wrong'), dict(self.article(), source='PMDA 用藥安全衛教')]:
+            c = FakeCollection([]); embed = Mock()
+            with self.assertRaises(ValueError):
+                ingest_batch([a], c, FakeVectorStore(), embed_fn=embed)
+            embed.assert_not_called()
+            self.assertEqual(c.docs, [])
+
+    def test_embedding_budget_stops_without_partial_article(self):
+        from ingest_education import ingest_batch
+        a = dict(self.article(), content='衛教測試。' * 300)
+        c = FakeCollection([]); embed = Mock(return_value=[0.01] * 3072)
+        report = ingest_batch([a], c, FakeVectorStore(), embed_fn=embed, max_embedding_calls=1)
+        self.assertEqual(report['embedding_calls'], 1)
+        self.assertEqual(c.docs, [])
+        self.assertTrue(report['write_failed'])
+
+    def test_cache_selection_only_checks_selected_source_health(self):
+        import json, tempfile, io
+        from pathlib import Path
+        from contextlib import redirect_stdout
+        from ingest_education import main
+        payload = dict(articles=[self.article()], crawl_stats=[
+            {'source': 'ECDC 疾病衛教', 'failed': 0},
+            {'source': '國健署主題衛教', 'failed': 1}])
+        with tempfile.TemporaryDirectory() as root:
+            p = Path(root) / 'public.json'; p.write_text(json.dumps(payload), encoding='utf-8')
+            with redirect_stdout(io.StringIO()):
+                rc = main(['--input', str(p), '--source', 'ecdc', '--limit', '1'])
+            self.assertEqual(rc, 0, '未選取来源的失败不可干扰此批')
+
+    def test_owned_url_updates_do_not_modify_foreign_source_same_url(self):
+        from main_pipeline import upload_to_mongodb
+        from test_system import fake_embed_ok
+        from bson import ObjectId
+        c = FakeCollection([]); s = FakeVectorStore(); a = self.article()
+        upload_to_mongodb([a], c, vector_store=s, embed_fn=fake_embed_ok)
+        foreign = dict(c.docs[0], _id=ObjectId(), source_name='手動收錄', chunk_content='既有他來源本文', claim='保留')
+        c.docs.append(foreign); s.upsert([(foreign['_id'], fake_embed_ok(''), None)])
+        embed = Mock(side_effect=AssertionError('metadata更新不可重算'))
+        self.assertEqual(upload_to_mongodb([dict(a, retrieved_at='new')], c, vector_store=s, embed_fn=embed), (0, False))
+        self.assertEqual(foreign['claim'], '保留')
+        self.assertEqual(foreign['retrieved_at'], a['retrieved_at'])
+        changed = dict(a, content=a['content'] + '\nChanged preventive text.')
+        self.assertEqual(upload_to_mongodb([changed], c, vector_store=s, embed_fn=fake_embed_ok), (1, False))
+        self.assertIn(foreign, c.docs)
+        self.assertIn(str(foreign['_id']), s.rows)
+        s.upsert = Mock(side_effect=RuntimeError('PG failure'))
+        failed = dict(a, content=a['content'] + '\nAnother content change.')
+        self.assertTrue(upload_to_mongodb([failed], c, vector_store=s, embed_fn=fake_embed_ok)[1])
+        self.assertIn(foreign, c.docs, '寫入失敗清理亦不可刪除同URL的其他來源')
+
+    def test_verification_groups_same_url_by_source(self):
+        from ingest_education import ingest_batch, verify_batch
+        from bson import ObjectId
+        from types import SimpleNamespace
+        a = self.article(); c = FakeCollection([]); s = FakeVectorStore()
+        ingest_batch([a], c, s, embed_fn=lambda _: [.01]*3072)
+        foreign = dict(c.docs[0], _id=ObjectId(), source_name='手動收錄', chunk_content='其他來源', claim='保留')
+        c.docs.append(foreign); s.upsert([(foreign['_id'], [.02]*3072, None)])
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def execute(self, sql, params): self.ids = params[0]
+            def fetchall(self):
+                return [(i, len(s.rows[i][0]), True, s.rows[i][1]) for i in self.ids if i in s.rows]
+        s._conn = SimpleNamespace(cursor=Cursor, commit=lambda: None)
+        report = verify_batch([a], c, s)
+        self.assertEqual(report['integrity_problems'], [])
+        self.assertEqual(report['sources'][a['source']], {'articles': 1, 'chunks': 1})
+        self.assertEqual(report['verified_pg_vectors'], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

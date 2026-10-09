@@ -29,7 +29,7 @@ jobs:
         run: uv sync --locked
 
       - name: Run tests
-        run: uv run python -m unittest test_system
+        run: uv run python -m unittest test_system test_education test_education_ingest
 
   # 測試過了才通知 CARE-infra 重新 build care-etl 映像並部署（同 CARE／CARE-LIFF
   # 的 trigger-deploy）。INFRA_DEPLOY_TOKEN 沒設時只留提示、不讓 CI 變紅：

@@ -10,6 +10,9 @@ from pymongo import MongoClient
 # 匯入我們自己寫好的爬蟲模組
 from claim_tagger import tag_untagged
 from scraper_api import get_api_articles
+from scraper_cdc import SOURCE_NAME as CDC_SOURCE_NAME, content_hash as education_content_hash
+from scraper_cdc import CrawlResult, crawl_cdc
+from scraper_education import SOURCES as EDUCATION_CONFIG, EDUCATION_SOURCES, crawl_education, normalize_education_url
 from scraper_cofacts import get_cofacts_articles
 from scraper_fda import get_fda_articles
 from scraper_mohw import get_mohw_articles
@@ -25,7 +28,12 @@ MONGO_URI = os.getenv("MONGO_URI")
 # 用可寫的 care_sync 帳號；CARE backend 用的 care_app 是唯讀的。
 PGVECTOR_DSN = os.getenv("PGVECTOR_SYNC_DSN")
 
-# 四個來源的正式名稱，與各爬蟲模組回傳的 source 欄位一致。
+# 額外中繼資料只保存上游有提供的欄位，不替其他既有來源推測語言或授權。
+ARTICLE_METADATA_FIELDS = ("content_type", "language", "jurisdiction", "license",
+                           "license_url", "attribution", "retrieved_at")
+GENERAL_EDUCATION_SOURCES = EDUCATION_SOURCES | {CDC_SOURCE_NAME}
+
+# 必須監測的來源正式名稱，與各爬蟲模組回傳的 source 欄位一致。
 # 任一來源本次一篇都沒抓到，就是異常——見 find_missing_sources 的說明。
 #
 # 命名原則：**來源名必須與實際發布機關一致**。這個欄位不是內部識別碼，它會
@@ -66,7 +74,16 @@ EXPECTED_SOURCES = frozenset({
 })
 
 
-def find_missing_sources(articles, expected=EXPECTED_SOURCES):
+def enabled_sources(env=None):
+    """CDC 尚未正式啟用時不抓取、不列入來源健康檢查。"""
+    env = os.environ if env is None else env
+    enabled = str(env.get("CDC_DISEASE_ENABLED", "false")).lower() in {"1", "true", "yes"}
+    extra = {cfg['source'] for cfg in EDUCATION_CONFIG.values()
+             if not cfg.get('blocked') and str(env.get(cfg['flag'], 'false')).lower() in {'1', 'true', 'yes'}}
+    return EXPECTED_SOURCES | extra | ({CDC_SOURCE_NAME} if enabled else set())
+
+
+def find_missing_sources(articles, expected=None, *, env=None):
     """回傳本次完全沒有產出任何文章的來源名稱集合。
 
     為什麼需要這個檢查：兩支爬蟲模組都用 `except Exception: print(...)`
@@ -78,6 +95,7 @@ def find_missing_sources(articles, expected=EXPECTED_SOURCES):
     刻意只看「有沒有產出」而不看數量：來源本身的文章數會自然波動，
     設數量門檻會產生假警報；而「一篇都沒有」幾乎必然是故障。
     """
+    expected = enabled_sources(env) if expected is None else expected
     seen = {a.get("source") for a in articles}
     return set(expected) - seen
 
@@ -218,6 +236,14 @@ def get_embedding(text: str, max_retries=3) -> list:
             time.sleep(5)
     return []
 
+def _education_stored_hash(collection, match, old, title):
+    if old.get("content_hash"):
+        return old["content_hash"]
+    chunks = sorted(collection.find(match), key=lambda d: d.get("chunk_index", 0))
+    return education_content_hash(old.get("original_title") or title,
+                            "".join(d.get("chunk_content", "") for d in chunks))
+
+
 def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
     """把文章切片、向量化後寫入：內文進 MongoDB，向量進 pgvector（`vector_store`）。
 
@@ -246,6 +272,15 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
     # 庫中標題為空的文章永遠比對不到，每天都會被當成新文章重新寫入一次。
     existing_urls = {u for u in collection.distinct("url") if u}
     existing_titles = {t for t in collection.distinct("original_title") if t is not None}
+    education_urls = {}
+    if any(a.get("source") in GENERAL_EDUCATION_SOURCES for a in articles):
+        # 只正規化新一般衛教來源的既有 URL，其他來源的識別規則不改。
+        for source in GENERAL_EDUCATION_SOURCES:
+            for doc in collection.find({"source_name": source}, {"url": 1}):
+                canonical = normalize_education_url(source, doc.get("url"))
+                if canonical:
+                    education_urls.setdefault(canonical, doc["url"])
+        existing_urls.update(education_urls)
 
     new_count = 0
     write_failed = False
@@ -260,6 +295,13 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
         try:
             url = article.get("url")
             title = article["title"]
+            is_education = article.get("source") in GENERAL_EDUCATION_SOURCES
+            if is_education:
+                url = normalize_education_url(article['source'], url)
+                if not url:
+                    raise ValueError("一般衛教文章 URL 不在允許範圍")
+            incoming_hash = education_content_hash(title, article["content"]) if is_education else None
+            metadata = {key: article[key] for key in ARTICLE_METADATA_FIELDS if key in article}
 
             # 決定這一篇要不要重寫。三種情形會重寫：
             #   (a) 切法換版——舊切片的邊界是錯的，見下方 (c) 的註解
@@ -267,7 +309,7 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
             #   (c) 來源提供的修改日期與庫中不同——改版
             # 中繼資料（日期、判定標籤）的補寫不在這三種之內：那只是一次
             # Mongo 寫入，與要不要重算向量是兩回事，見下方獨立的那一支。
-            # 刻意不用內容雜湊比對：那會讓每次清洗邏輯微調都觸發全量重寫。
+            # 舊來源不新增雜湊判定，避免清洗微調造成全量重寫；新一般衛教缺日期才比 hash。
             # 這裡只做判定，實際刪除延後到 insert_many 之前（見下方），
             # 確保「刪掉舊版卻寫不出新版」這種資料遺失不會發生。
             incoming_updated = article.get("updated_at")
@@ -285,11 +327,16 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
             # 標題當鍵是安全的：下面「已存在就跳過」本來就在用
             # `title in existing_titles` 判定同一篇，這裡只是讓比對鍵與去重鍵
             # 一致。實測無網址的文章跨來源撞名 0 筆。
-            match = {"url": url} if url else {"url": None, "original_title": title}
+            stored_url = education_urls.get(url, url) if is_education else url
+            match = {"url": stored_url} if url else {"url": None, "original_title": title}
+            if is_education:
+                # 已有人工／其他來源使用同一 URL 時，不能把它們算進破洞、補 metadata
+                # 或改版刪除。新衛教來源只更新自己擁有的切片。
+                match['source_name'] = article['source']
             old = collection.find_one(
                 match,
                 {"updated_at": 1, "published_at": 1, "total_chunks": 1,
-                 "chunker_version": 1},
+                 "chunker_version": 1, "content_hash": 1, "original_title": 1, "source_name": 1},
             )
             if old is not None:
                 declared = old.get("total_chunks")
@@ -348,6 +395,7 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
                     print(f"  ✂️ 切法已更新（v{old_chunker} → v{CHUNKER_VERSION}），"
                           f"將重切: {title[:15]}...")
                     needs_rewrite = True
+
                 elif declared is not None and actual != declared:
                     # 破洞：舊版逐塊寫入時某塊向量化失敗只印警告、其餘照常寫入；
                     # 或寫入中途失敗留下前綴（insert_many 預設 ordered=True）。
@@ -368,7 +416,21 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
                     print(f"  🔄 偵測到改版，將重寫: {title[:15]}...")
                     needs_rewrite = True
 
-            if not needs_rewrite and ((url and url in existing_urls) or title in existing_titles):
+                # 僅 CDC 無可信更新日的文章使用正文雜湊，其他來源維持既有日期規則。
+                if is_education and not incoming_updated and not needs_rewrite:
+                    # 舊 hash 缺漏時從實際存放的完整切片建立基準，不直接貼上新 hash。
+                    old_hash = _education_stored_hash(collection, match, old, title)
+                    needs_rewrite = old_hash != incoming_hash
+
+            already_exists = (url in existing_urls) if is_education and url else (
+                (url and url in existing_urls) or title in existing_titles)
+            if not needs_rewrite and already_exists:
+                if is_education and old is not None:
+                    # 同一正文僅更新 metadata，不消耗 embedding。既有缺欄位逐篇補齊，
+                    # 不執行全庫回填；重寫分支則等新版成功寫入才保存新 metadata/hash。
+                    stored_hash = _education_stored_hash(collection, match, old, title)
+                    collection.update_many(match, {"$set": {**metadata, "url": url, "content_hash": stored_hash,
+                                                            "claim": None, "verdict": None, "verdict_slug": None}})
                 print(f"  ⏭️ 已存在，跳過: {title[:15]}...")
                 continue
 
@@ -420,10 +482,12 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
                     "uploaded_at": time.time(),
                     "published_at": article.get("published_at"),
                     "updated_at": article.get("updated_at"),
-                    "verdict": article.get("verdict"),
-                    "verdict_slug": article.get("verdict_slug"),
-                    "claim": article.get("claim"),
+                    "verdict": None if is_education else article.get("verdict"),
+                    "verdict_slug": None if is_education else article.get("verdict_slug"),
+                    "claim": None if is_education else article.get("claim"),
                     "chunker_version": CHUNKER_VERSION,
+                    **metadata,
+                    **({"content_hash": incoming_hash} if is_education else {}),
                 }
                 for i, chunk in enumerate(chunks)
             ]
@@ -466,7 +530,7 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
                 # 清乾淨，讓它下次執行以全新文章重新寫入。
                 try:
                     collection.delete_many(
-                        {"url": url} if url else {"original_title": title})
+                        {"_id": {"$in": [doc['_id'] for doc in docs]}})
                     print("     🧹 已清除本篇殘留的切片，下次執行會重新寫入")
                 except Exception as cleanup_error:
                     print(f"     ⚠️ 清除殘留切片失敗："
@@ -521,8 +585,34 @@ def run_media_job():
     return media_job(collection_factory=_default_media_collection)
 
 
+def build_fetchers(env=None, *, cdc_fetcher=None):
+    """組裝來源；CDC 的分批設定僅影響 CDC，其餘來源維持原流程。"""
+    env = os.environ if env is None else env
+    fetchers = [
+        lambda: get_api_articles(test_mode=False),
+        lambda: get_fda_articles(test_mode=False),
+        lambda: get_tfc_articles(test_mode=False),
+        lambda: get_mohw_articles(test_mode=False),
+        lambda: get_cofacts_articles(test_mode=False),
+    ]
+    if CDC_SOURCE_NAME in enabled_sources(env):
+        maximum = int(env.get("CDC_DISEASE_MAX_ARTICLES", "200"))
+        start_at = int(env.get("CDC_DISEASE_START_AT", "0"))
+        if not 1 <= maximum <= 200 or start_at < 0:
+            raise ValueError("CDC_DISEASE_MAX_ARTICLES 必須為 1..200，START_AT 必須非負")
+        fetch = cdc_fetcher or crawl_cdc
+        fetchers.append(lambda: fetch(max_articles=maximum, start_at=start_at))
+    for key, cfg in EDUCATION_CONFIG.items():
+        if cfg['source'] in enabled_sources(env):
+            maximum = int(env.get(cfg['flag'].replace('_ENABLED', '_MAX_ARTICLES'), '200'))
+            start_at = int(env.get(cfg['flag'].replace('_ENABLED', '_START_AT'), '0'))
+            fetchers.append(lambda key=key, maximum=maximum, start_at=start_at:
+                            crawl_education(key, max_articles=maximum, start_at=start_at))
+    return tuple(fetchers)
+
+
 def job(*, fetchers=None, collection_factory=None, vector_store_factory=None,
-        embed_fn=None):
+        embed_fn=None, env=None):
     """執行一次完整 ETL。回傳 0 表示正常，1 表示有來源全滅或寫入失敗。
 
     三個關鍵字參數是給測試用的依賴注入點，預設為正式環境的爬蟲模組、
@@ -530,27 +620,30 @@ def job(*, fetchers=None, collection_factory=None, vector_store_factory=None,
     核心保證之一，必須能在不發出任何網路請求的情況下驗證。
     """
     if fetchers is None:
-        fetchers = (
-            lambda: get_api_articles(test_mode=False),
-            lambda: get_fda_articles(test_mode=False),
-            lambda: get_tfc_articles(test_mode=False),
-            lambda: get_mohw_articles(test_mode=False),
-            lambda: get_cofacts_articles(test_mode=False),
-        )
+        fetchers = build_fetchers(env)
     collection_factory = collection_factory or _default_collection
     vector_store_factory = vector_store_factory or _default_vector_store
 
     print(f"\n=== 🟢 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動正式爬蟲任務 ===")
     print("\n[階段一：呼叫爬蟲模組提取資料]")
     all_articles = []
+    healthy_empty_sources = set()
 
     for fetch in fetchers:
-        all_articles.extend(fetch())
+        result = fetch()
+        if isinstance(result, CrawlResult):
+            all_articles.extend(result.articles)
+            # 合法分批起點已到索引末端：robots、授權及索引均成功，這是無待辦，
+            # 不等同來源失效。一般全量抓取仍須取得有效文章才能通過健康檢查。
+            if result.stats.get("exhausted") and not result.stats.get("failed"):
+                healthy_empty_sources.add(result.stats.get('source', CDC_SOURCE_NAME))
+        else:
+            all_articles.extend(result)
 
     print(f"\n🏁 階段一完成！總共收集到 {len(all_articles)} 篇待處理的文章。")
 
     exit_code = 0
-    missing = find_missing_sources(all_articles)
+    missing = find_missing_sources(all_articles, env=env) - healthy_empty_sources
     if missing:
         print(f"\n❌ 嚴重：以下來源本次完全沒有取得任何文章：{'、'.join(sorted(missing))}")
         print("   這通常代表爬蟲失效、來源網站改版、或網路／憑證問題。")

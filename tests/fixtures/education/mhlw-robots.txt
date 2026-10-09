@@ -1,0 +1,7 @@
+# 
+# robots.txt for http://www.mhlw.go.jp/
+# 
+User-agent: *        
+Disallow: /cgi-bin/   
+Disallow: /images/	
+Disallow: /topics/bukyoku/iyaku/kaisyu/00-1-010.html

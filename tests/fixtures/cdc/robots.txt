@@ -1,0 +1,6 @@
+User-agent: *
+Disallow: /Uploads/
+Disallow: /LogFiles/
+Disallow: /TTS/
+Disallow: /File/
+Allow: /*

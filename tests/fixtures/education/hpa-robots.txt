@@ -1,0 +1,5 @@
+User-agent: *
+
+Disallow: /File
+Disallow: /Pages/ashx/File.ashx
+Disallow: /Pages/ashx/GetFile.ashx
