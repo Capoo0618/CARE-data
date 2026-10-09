@@ -83,14 +83,17 @@ def verify_batch(articles, collection, store):
     grouped = {}
     for d in docs:
         grouped.setdefault(d['url'], []).append(d)
-    problems = []; remaining = []; covered = []; counts = {}
+    problems = []; remaining = []; covered = []; counts = {}; owned_ids = set()
     for a in articles:
-        chunks = sorted(grouped.get(a['url'], []), key=lambda d: d.get('chunk_index', 0))
-        if not chunks:
+        matches = grouped.get(a['url'], [])
+        if not matches:
             remaining.append(a['url']); continue
-        if chunks[0]['source_name'] != a['source']:
-            covered.append(dict(url=a['url'], source=chunks[0]['source_name']))
+        chunks = sorted((d for d in matches if d['source_name'] == a['source']),
+                        key=lambda d: d.get('chunk_index', 0))
+        if not chunks:
+            covered.append(dict(url=a['url'], source=matches[0]['source_name']))
             continue
+        owned_ids.update(str(d['_id']) for d in chunks)
         expected = chunk_text(a['content'])
         if (len(chunks) != len(expected) or [d['chunk_content'] for d in chunks] != expected
                 or [d['chunk_index'] for d in chunks] != list(range(1, len(expected) + 1))
@@ -104,7 +107,7 @@ def verify_batch(articles, collection, store):
         item = counts.setdefault(a['source'], dict(articles=0, chunks=0))
         item['articles'] += 1; item['chunks'] += len(chunks)
     return dict(sources=counts, remaining_urls=remaining, covered_by_existing_sources=covered,
-                integrity_problems=problems, verified_pg_vectors=len(rows))
+                integrity_problems=problems, verified_pg_vectors=len(owned_ids & vectors.keys()))
 
 
 def check_cached_policies(articles):

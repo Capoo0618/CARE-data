@@ -329,15 +329,16 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
             # 一致。實測無網址的文章跨來源撞名 0 筆。
             stored_url = education_urls.get(url, url) if is_education else url
             match = {"url": stored_url} if url else {"url": None, "original_title": title}
+            if is_education:
+                # 已有人工／其他來源使用同一 URL 時，不能把它們算進破洞、補 metadata
+                # 或改版刪除。新衛教來源只更新自己擁有的切片。
+                match['source_name'] = article['source']
             old = collection.find_one(
                 match,
                 {"updated_at": 1, "published_at": 1, "total_chunks": 1,
                  "chunker_version": 1, "content_hash": 1, "original_title": 1, "source_name": 1},
             )
             if old is not None:
-                if is_education and old.get("source_name") != article['source']:
-                    print(f"  ⏭️ 同一 URL 已由其他來源保存，保留原資料: {title[:15]}...")
-                    continue
                 declared = old.get("total_chunks")
                 # 必須用 match 而不是 {"url": url}：url 為 None 時後者會數到
                 # 全部沒有網址的文章（線上 1,145 個切片），每一篇都會被判成
@@ -529,7 +530,7 @@ def upload_to_mongodb(articles, collection, *, vector_store, embed_fn=None):
                 # 清乾淨，讓它下次執行以全新文章重新寫入。
                 try:
                     collection.delete_many(
-                        {"url": url} if url else {"original_title": title})
+                        {"_id": {"$in": [doc['_id'] for doc in docs]}})
                     print("     🧹 已清除本篇殘留的切片，下次執行會重新寫入")
                 except Exception as cleanup_error:
                     print(f"     ⚠️ 清除殘留切片失敗："

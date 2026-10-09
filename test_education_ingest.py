@@ -55,6 +55,47 @@ class TestEducationIngest(unittest.TestCase):
                 rc = main(['--input', str(p), '--source', 'ecdc', '--limit', '1'])
             self.assertEqual(rc, 0, '未選取来源的失败不可干扰此批')
 
+    def test_owned_url_updates_do_not_modify_foreign_source_same_url(self):
+        from main_pipeline import upload_to_mongodb
+        from test_system import fake_embed_ok
+        from bson import ObjectId
+        c = FakeCollection([]); s = FakeVectorStore(); a = self.article()
+        upload_to_mongodb([a], c, vector_store=s, embed_fn=fake_embed_ok)
+        foreign = dict(c.docs[0], _id=ObjectId(), source_name='手動收錄', chunk_content='既有他來源本文', claim='保留')
+        c.docs.append(foreign); s.upsert([(foreign['_id'], fake_embed_ok(''), None)])
+        embed = Mock(side_effect=AssertionError('metadata更新不可重算'))
+        self.assertEqual(upload_to_mongodb([dict(a, retrieved_at='new')], c, vector_store=s, embed_fn=embed), (0, False))
+        self.assertEqual(foreign['claim'], '保留')
+        self.assertEqual(foreign['retrieved_at'], a['retrieved_at'])
+        changed = dict(a, content=a['content'] + '\nChanged preventive text.')
+        self.assertEqual(upload_to_mongodb([changed], c, vector_store=s, embed_fn=fake_embed_ok), (1, False))
+        self.assertIn(foreign, c.docs)
+        self.assertIn(str(foreign['_id']), s.rows)
+        s.upsert = Mock(side_effect=RuntimeError('PG failure'))
+        failed = dict(a, content=a['content'] + '\nAnother content change.')
+        self.assertTrue(upload_to_mongodb([failed], c, vector_store=s, embed_fn=fake_embed_ok)[1])
+        self.assertIn(foreign, c.docs, '寫入失敗清理亦不可刪除同URL的其他來源')
+
+    def test_verification_groups_same_url_by_source(self):
+        from ingest_education import ingest_batch, verify_batch
+        from bson import ObjectId
+        from types import SimpleNamespace
+        a = self.article(); c = FakeCollection([]); s = FakeVectorStore()
+        ingest_batch([a], c, s, embed_fn=lambda _: [.01]*3072)
+        foreign = dict(c.docs[0], _id=ObjectId(), source_name='手動收錄', chunk_content='其他來源', claim='保留')
+        c.docs.append(foreign); s.upsert([(foreign['_id'], [.02]*3072, None)])
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def execute(self, sql, params): self.ids = params[0]
+            def fetchall(self):
+                return [(i, len(s.rows[i][0]), True, s.rows[i][1]) for i in self.ids if i in s.rows]
+        s._conn = SimpleNamespace(cursor=Cursor, commit=lambda: None)
+        report = verify_batch([a], c, s)
+        self.assertEqual(report['integrity_problems'], [])
+        self.assertEqual(report['sources'][a['source']], {'articles': 1, 'chunks': 1})
+        self.assertEqual(report['verified_pg_vectors'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -63,11 +63,10 @@ class FakeCollection:
         self.docs.extend(docs)
 
     def delete_many(self, query):
-        """支援 {"url": ...} 與 {"original_title": ...} —— 與 main_pipeline
-        實際用法一致（url 為 None 的來源以標題為刪除鍵）。"""
+        """支援 URL／標題、來源條件及精確 ID 的 $in，符合 Mongo 比對語意。"""
         self.deleted_filters.append(query)
         self.docs = [d for d in self.docs
-                     if not all(d.get(k) == v for k, v in query.items())]
+                     if not _fake_matches(d, query)]
 
     def update_many(self, filt, update):
         """支援 {"url": ...} 與 {"_id": {"$in": [...]}} 條件、$set 與 $unset

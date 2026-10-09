@@ -69,3 +69,7 @@ RAG 使用；每日自動抓取新介紹與改版，仍待 PR #10 合併並部�
 詳細 JSON 證據在本機忽略版控的 `backups/cdc-expansion-2026-10-08.json`，包含文章
 清單、切片數與查詢命中排名，不含金鑰。初次單篇驗證另存於
 `backups/cdc-single-ingestion-2026-10-08.json`。
+
+2026-10-09 擴充官方衛教來源時，已為本來源所有 524 個切片補齊 7 個授權／來源
+metadata 與穩定正文 hash，並獨立讀回驗證；本輪沒有重算 CDC 向量。
+新增來源、實際批次與檢索結果見 [官方衛教驗證](../expand-health-education/verification.md)。
