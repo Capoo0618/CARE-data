@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scraper_cdc import crawl_cdc, SOURCE_NAME as CDC_SOURCE, LICENSE_NAME, LICENSE_URL, LICENSE_BODY_SHA256
-from scraper_education import SOURCES, crawl_education, check_policy, normalize_education_url
+from scraper_education import SOURCES, crawl_education, check_policy, normalize_education_url, is_hpa_route
 from cdc_access import CDCAccess
 from utils import make_soup
 
@@ -37,6 +37,8 @@ def validate_articles(articles):
         cfg = configs.get(article.get('source'))
         if cfg is None or not normalize_education_url(article['source'], article.get('url')):
             raise ValueError('輸入含未知、停用來源或不允許的 URL')
+        if article['source'] == SOURCES['hpa']['source'] and is_hpa_route(article.get('content', '')):
+            raise ValueError('快取包含運動路線／場地名錄，不屬本次衛教範圍')
         for key in ('license', 'license_url', 'language', 'jurisdiction'):
             if article.get(key) != cfg[key]:
                 raise ValueError('輸入授權／語言／地區與來源規格不符：' + key)
@@ -153,7 +155,8 @@ def main(argv=None):
             if args.offset <= n < args.offset + args.limit:
                 selected.append(a)
         articles = selected
-        stats = payload.get('crawl_stats', [])
+        stats = [s for s in payload.get('crawl_stats', [])
+                 if not args.source or s.get('source') in names]
     else:
         articles = []; stats = []
         for key in args.source or ('cdc', 'hpa', 'ecdc', 'mhlw', 'pmda'):

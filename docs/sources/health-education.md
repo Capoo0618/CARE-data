@@ -18,7 +18,7 @@
 
 robots 實測限制：CDC `/Uploads/`、`/LogFiles/`、`/TTS/`、`/File/`；HPA `/File`、`/Pages/ashx/File.ashx`、`/Pages/ashx/GetFile.ashx`；ECDC 管理、搜尋、登入、oembed、core／profiles 等；MHLW `/cgi-bin/`、`/images/` 及指定藥品回收路徑。上述收錄入口未被禁止。PMDA robots 回 404，但網站政策已禁止自動巡迴，不以缺少 robots 當作可抓取。
 
-所有來源排除行政／新聞列表、個資、第三方或另行限制素材、PDF／Office 附件、圖片 OCR、影音與外站；純導覽／附件且缺正文不以整頁文字補救。連結只走既定分類區，站外與非法路徑在發請求前拒絕，redirect 每跳再檢查 robots／白名單。遇到 403 或封鎖不繞過。
+所有來源排除行政／新聞列表、個資、第三方或另行限制素材、PDF／Office 附件、圖片 OCR、影音與外站；純導覽／附件且缺正文不以整頁文字補救。國健署的社區健走步道目錄（nodeid=332）及個別公園／場地路線、地址、交通名錄亦排除：屬場地資訊，本輪只收運動衛教。解析與快取入庫均檢查此限制，不能透過舊預覽 JSON 誤入庫。連結只走既定分類區，站外與非法路徑在發請求前拒絕，redirect 每跳再檢查 robots／白名單。遇到 403 或封鎖不繞過。
 
 ## 資料與增量規則
 

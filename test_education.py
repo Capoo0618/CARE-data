@@ -61,6 +61,17 @@ class TestEducationSources(unittest.TestCase):
         self.assertEqual(len(result.articles), 1)
         self.assertIn('/Pages/List.aspx?', result.articles[0]['url'])
 
+    def test_hpa_route_directory_is_excluded_from_education(self):
+        from scraper_education import parse_article, discover_links, SOURCES
+        from cdc_access import AccessDenied
+        html = (FIXTURES / 'hpa-detail.html').read_text().replace('均衡飲食</h4>', '均衡飲食</h4><p>健走步道地點 公園。健走範圍 1公里。相關資訊 地址與交通。</p>')
+        with self.assertRaises(AccessDenied):
+            parse_article('hpa', html, SOURCES['hpa']['sample_url'])
+        html = '<div class="ContentWrap"><div class="tl-item"><a href="/Pages/List.aspx?nodeid=332">社區健走步道</a><a href="/Pages/List.aspx?nodeid=333">健康體能</a></div></div>'
+        rows = discover_links('hpa', html, 'https://www.hpa.gov.tw/Pages/List.aspx?nodeid=37', 0)
+        self.assertEqual(len(rows), 1)
+        self.assertIn('nodeid=333', rows[0][0])
+
     def test_article_navigation_is_not_body(self):
         from scraper_education import parse_article, SOURCES
         html = (FIXTURES / 'hpa-detail.html').read_text().replace('</div></div><footer>',

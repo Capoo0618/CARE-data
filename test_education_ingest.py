@@ -41,6 +41,20 @@ class TestEducationIngest(unittest.TestCase):
         self.assertEqual(c.docs, [])
         self.assertTrue(report['write_failed'])
 
+    def test_cache_selection_only_checks_selected_source_health(self):
+        import json, tempfile, io
+        from pathlib import Path
+        from contextlib import redirect_stdout
+        from ingest_education import main
+        payload = dict(articles=[self.article()], crawl_stats=[
+            {'source': 'ECDC 疾病衛教', 'failed': 0},
+            {'source': '國健署主題衛教', 'failed': 1}])
+        with tempfile.TemporaryDirectory() as root:
+            p = Path(root) / 'public.json'; p.write_text(json.dumps(payload), encoding='utf-8')
+            with redirect_stdout(io.StringIO()):
+                rc = main(['--input', str(p), '--source', 'ecdc', '--limit', '1'])
+            self.assertEqual(rc, 0, '未選取来源的失败不可干扰此批')
+
 
 if __name__ == '__main__':
     unittest.main()

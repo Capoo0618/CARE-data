@@ -11,7 +11,7 @@ import sys
 import time
 from collections import deque
 from datetime import date, datetime, timezone
-from urllib.parse import urljoin, urlsplit, urlunsplit, unquote_plus
+from urllib.parse import urljoin, urlsplit, urlunsplit, unquote_plus, parse_qs
 
 from bs4 import BeautifulSoup
 from cdc_access import CDCAccess, AccessDenied, RequestLimit, TRACKING_KEYS, SECRET_KEYS
@@ -144,6 +144,10 @@ def check_mhlw_annex(html):
         raise AccessDenied('MHLW 授權排除別紙異動，停止來源並待人工重新確認')
 
 
+def is_hpa_route(content):
+    return '健走步道地點' in content or ('健走範圍' in content and '相關資訊' in content)
+
+
 def parse_article(key, html, url):
     cfg = SOURCES[key]; soup = _soup(html)
     canonical = normalize_source_url(key, url)
@@ -193,6 +197,8 @@ def parse_article(key, html, url):
                 or re.search(r'\.(?:pdf|docx?|xlsx?|pptx?|mp4|jpe?g|png)(?:\?|$)', href, re.I)):
             a.decompose()
     text = _body_text(body)
+    if key == 'hpa' and is_hpa_route(text):
+        raise AccessDenied('運動場地／路線名錄，非本次衛教正文')
     if key == 'ecdc' and len(text) < 200 and text.startswith('This page contains'):
         raise AccessDenied('只有欄目導覽摘要，没有疾病／預防正文')
     if RIGHTS.search(text):
@@ -228,6 +234,8 @@ def discover_links(key, html, url, depth):
         target = normalize_source_url(key, urljoin(url, a['href']))
         if not target or target == url:
             continue
+        if key == 'hpa' and parse_qs(urlsplit(target).query).get('nodeid') == ['332']:
+            continue  # 官方社區健走步道目錄：場地／交通資訊，第一階段不收。
         if key == 'ecdc' and depth > 0 and not (urlsplit(target).path in ECDC_EXTRA_PAGES or
                 re.search(r'/(?:facts|factsheet|prevention-and-control)$', urlsplit(target).path)):
             continue
