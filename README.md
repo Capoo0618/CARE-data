@@ -18,6 +18,14 @@
 | 國健署真相與闢謠 | `scraper_mohw.py` | 同上，連結指向 `hpa.gov.tw` | ✅ | ❌ | ❌ | ✅ 正常 |
 | 疾管署闢謠專區 | `scraper_mohw.py` | 同上，連結指向 `cdc.gov.tw` | ✅ | ❌ | ❌ | ⚠️ 停在 110 年 |
 | 疾管署疾病介紹 | `scraper_cdc.py` | 官方傳染病索引 → 疾病專頁 → 中文疾病介紹 | ✅ | ✅ 最後更新日期（有提供時） | ❌ 一般衛教不做查核標記 | 每次重抓，由 ETL 監測空來源 |
+| 國健署主題衛教 | `scraper_education.py` | 四個主題 HTML 分類／文章與 idx 翻頁，與新聞 API 並存 | ✅ | ✅ 日期／缺日期正文 hash | ❌ | 預設停用，正式驗證後啟用 |
+| ECDC 疾病衛教 | `scraper_education.py` | 英文疾病專區的自有 HTML 介紹 | ✅ | ✅ 缺日期正文 hash | ❌ | 預設停用，歐盟／EEA metadata |
+| 厚生勞動省健康與疾病預防 | `scraper_education.py` | 指定日文健康／預防 HTML 頁白名單 | ✅ | ✅ 版本日／缺日期正文 hash | ❌ | 預設停用，日本 metadata |
+| PMDA 用藥安全衛教 | `scraper_education.py` | 尚未啟用、不發 HTTP | — | — | ❌ | 網站政策禁止自動巡迴下載，待確認取得方式 |
+
+各來源的官方入口、授權確認（2026-10-09）、排除範圍、metadata、預覽與分批入庫操作，見
+[官方一般健康衛教接入](docs/sources/health-education.md)。所有新增來源沿用 MongoDB／pgvector，
+一般衛教不加入查核標記；PMDA 不繞過網站下載限制。預覽不需 env，也不呼叫 embedding。
 
 ### 一般健康衛教：疾管署疾病介紹（第一階段）
 
@@ -27,14 +35,16 @@
 教材、PDF／圖片附件或外站，也不將疾病專頁的摘要當成介紹正文。
 
 - `source` 固定為 **疾管署疾病介紹**；標題為 `<疾病名稱>－疾病介紹`，避免各頁都叫
-  「疾病介紹」而被既有標題去重機制當成同一篇。引用網址指向官方介紹明細頁。
+  「疾病介紹」。新來源以 URL 識別，同名不同 URL 也能收錄。引用網址指向官方介紹明細頁。
 - 只取文章正文容器，剝除 script／style；保留段落、列表與表格文字供既有 chunker
   切片。側欄、分享／短網址控制項、日期與頁尾不進入向量化。
 - 明確標示的發布／最後更新日期正規化為 `YYYY-MM-DD`（包含民國日期轉換）；
   缺漏或非法日期保留 `None`，不把更新日、抓取日或頁尾日期當成發布日。
-- 以正規化的官方明細 URL 去重（移除查詢追蹤參數與 fragment）。有更新日期時，
-  沿用 ETL 的改版替換；未改版不重新向量化。缺少更新日期時沿用「已存在即跳過」
-  的限制；站方若未更新日期，正文變更也無法被偵測。
+- 以正規化的官方明細 URL 去重（只移除列明追蹤參數與 fragment，未知 query 保留）。
+  有更新日期時沿用 ETL 的改版替換；缺少更新日期以清理後標題／正文 hash 比對。
+  僅抓取時間／署名等 metadata 改變不重算向量；其他既有來源的去重更新規則不變。
+- 每個 chunk 保存授權、署名、語言、適用地區、實際取得時間與正文 hash。
+  每輪確認 robots 與授權正文指紋；第三方／另行限制素材、禁止路徑停用並回報。
 - `claim`／`verdict`／`verdict_slug` 入庫為 `None`，不加入 `claim_tagger.SOURCES`。
   它是一般衛教來源，與從衛福部真相說明彙整頁取得的 **疾管署闢謠專區** 分開。
 - 內文仍寫入 `CARE_database.health_articles_chunks`，向量仍寫入 PostgreSQL
@@ -43,8 +53,8 @@
   `daily_health_news` 是媒體推播資料，不是本來源的寫入目標。
 - TLS 驗證沿用 `get_ca_bundle()`，每次請求逾時 25 秒、間隔 0.4 秒；連線／逾時／
   HTTP 429／5xx 使用既有 3 次重試與 2／5 秒退避。單篇失敗記錄網址並繼續，
-  抓取失敗不刪除既有資料。整個來源零產出由 `EXPECTED_SOURCES` 讓 ETL 回傳 1，
-  其餘來源仍正常寫入。
+  抓取失敗不刪除既有資料。`CDC_DISEASE_ENABLED` 預設 false，停用時不抓取／不做健康檢查；
+  啟用後整個來源零產出讓 ETL 回傳 1（合法分批 offset 已到末端除外），其餘來源仍正常寫入。
 
 首次收錄使用既有 embedding 額度限制，可能分多個排程週期完成。測試與爬蟲預覽
 不呼叫 Gemini，也不寫入正式資料庫：
@@ -54,8 +64,8 @@
 uv run python -m unittest test_system.TestCDCDiseaseScraper test_system.TestCDCDiseaseIntegration -v
 # 線上：與官方索引及介紹正文動態比對
 uv run python -m unittest test_system.TestCDCDiseaseLive -v
-# 預覽：只抓最多 3 篇，列出標題／更新日／網址
-uv run python scraper_cdc.py
+# 預覽：只抓最多 3 篇，輸出 JSON 與 metadata／成功、排除、失敗統計
+uv run python scraper_cdc.py --preview --limit 3
 ```
 
 HTML fixtures 位於 `tests/fixtures/cdc/`，依官方 DOM 精簡並使用測試文字。完整測試

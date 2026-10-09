@@ -47,7 +47,8 @@ Mongo 內文與 PG 向量契約，SHALL NOT 寫入 daily_health_news 或加入�
 
 ### Requirement: 疾病介紹來源失效可見
 
-系統 SHALL 將疾管署疾病介紹納入 EXPECTED_SOURCES，單疾病失敗 SHALL 記錄並繼續，
+系統 SHALL 在 CDC_DISEASE_ENABLED 啟用時將疾管署疾病介紹納入來源健康檢查，預設停用。
+只有合法批次 offset 已到末端可視為正常無待辦；全部失敗或被排除不豁免。單疾病失敗 SHALL 記錄並繼續，
 來源零產出 SHALL 讓 ETL 回傳非零退出碼，其他來源仍照常寫入。
 
 #### Scenario: 闢謠有資料但疾病介紹零產出
@@ -55,3 +56,14 @@ Mongo 內文與 PG 向量契約，SHALL NOT 寫入 daily_health_news 或加入�
 - **WHEN** 本次取得疾管署闢謠專區資料，但疾病介紹沒有任何有效文章
 - **THEN** 系統仍報疾管署疾病介紹失效，不能以闢謠資料替代其健康檢查
 - **AND** 其餘來源仍正常入庫
+
+### Requirement: 衛教 metadata 與缺日期更新
+
+每個 Mongo chunk SHALL 保存 content_type、language、jurisdiction、license、license_url、
+attribution、retrieved_at；CDC 缺更新日期時 SHALL 比較清理後標題／正文 content_hash。
+舊資料缺欄位 SHALL 保持相容，SHALL NOT 觸發全庫回填或其他來源重算。
+
+#### Scenario: 只有取得時間改變
+
+- **WHEN** URL 與正文未變，只有 retrieved_at 改變
+- **THEN** 更新 metadata 而不再次 embedding 或新增切片

@@ -2447,13 +2447,13 @@ class TestCDCDiseaseIntegration(unittest.TestCase):
         articles = TestHealthETLPipeline()._all_source_articles()
         articles = [a for a in articles if a["source"] != "疾管署疾病介紹"]
         articles.append({"source": "疾管署闢謠專區"})
-        self.assertEqual(main_pipeline.find_missing_sources(articles), {"疾管署疾病介紹"})
+        self.assertEqual(main_pipeline.find_missing_sources(articles, env={"CDC_DISEASE_ENABLED": "1"}), {"疾管署疾病介紹"})
 
     def test_missing_cdc_turns_job_red_but_other_sources_still_write(self):
         articles = [a for a in TestHealthETLPipeline()._all_source_articles()
                     if a["source"] != "疾管署疾病介紹"]
         collection, store = FakeCollection(), FakeVectorStore()
-        rc = main_pipeline.job(fetchers=(lambda: articles, lambda: []),
+        rc = main_pipeline.job(env={"CDC_DISEASE_ENABLED": "1"}, fetchers=(lambda: articles, lambda: []),
                                collection_factory=lambda: collection,
                                vector_store_factory=lambda: store, embed_fn=fake_embed_ok)
         self.assertEqual(rc, 1)
@@ -2547,7 +2547,7 @@ class TestCDCDiseaseScraper(unittest.TestCase):
         response = requests.Response()
         response.status_code = status
         response.url = url
-        response.headers["content-type"] = "text/html; charset=utf-8"
+        response.headers["content-type"] = "text/plain; charset=utf-8" if url.endswith("robots.txt") else "text/html; charset=utf-8"
         response.encoding = "utf-8"
         response._content = html.encode("utf-8")
         return response
@@ -2616,6 +2616,8 @@ class TestCDCDiseaseScraper(unittest.TestCase):
 
     def pages(self):
         return {
+            "https://www.cdc.gov.tw/robots.txt": self.fixture("robots.txt"),
+            "https://www.cdc.gov.tw/Category/FPage/TxkBIR9agw_IBRRmvn9TcQ": self.fixture("license.html"),
             "https://www.cdc.gov.tw/Disease/Index": self.fixture("index.html"),
             "https://www.cdc.gov.tw/Disease/SubIndex/dengue": self.fixture("subindex.html"),
             "https://www.cdc.gov.tw/Disease/SubIndex/enterovirus": self.fixture("subindex.html").replace("Page/dengue", "Page/enterovirus"),
@@ -2668,7 +2670,7 @@ class TestCDCDiseaseScraper(unittest.TestCase):
 
         def get(url):
             attempts.append(url)
-            status = 503 if len(attempts) == 1 else 200
+            status = 503 if url.endswith("/Disease/Index") and attempts.count(url) == 1 else 200
             return self.response(pages[url], url, status)
 
         articles = get_cdc_articles(get=get, sleep=slept.append, sleep_seconds=0)
@@ -2680,7 +2682,9 @@ class TestCDCDiseaseScraper(unittest.TestCase):
         from scraper_cdc import get_cdc_articles
         index = '<ul class="infectious_disease_ul">' + ''.join(
             f'<li><a href="/Disease/SubIndex/d{i}">疾病{i}</a></li>' for i in range(5)) + '</ul>'
-        pages = {"https://www.cdc.gov.tw/Disease/Index": index}
+        pages = {"https://www.cdc.gov.tw/Disease/Index": index,
+                 "https://www.cdc.gov.tw/robots.txt": self.fixture("robots.txt"),
+                 "https://www.cdc.gov.tw/Category/FPage/TxkBIR9agw_IBRRmvn9TcQ": self.fixture("license.html")}
         for i in range(5):
             pages[f"https://www.cdc.gov.tw/Disease/SubIndex/d{i}"] = self.fixture("subindex.html").replace("Page/dengue", f"Page/d{i}")
             pages[f"https://www.cdc.gov.tw/Category/Page/d{i}"] = self.fixture("detail.html")
@@ -2734,6 +2738,388 @@ class TestCDCDiseaseLive(unittest.TestCase):
         normalized_content = re.sub(r"\s+", "", first["content"])
         for paragraph in (paragraphs[0], paragraphs[-1]):
             self.assertIn(re.sub(r"\s+", "", paragraph), normalized_content)
+
+
+class TestCDCMetadataAndUpdates(unittest.TestCase):
+    def article(self):
+        return TestCDCDiseaseScraper().parse()
+
+    def test_metadata_is_in_every_written_chunk(self):
+        article=self.article()
+        collection,store=FakeCollection(),FakeVectorStore()
+        main_pipeline.upload_to_mongodb([article],collection,vector_store=store,embed_fn=fake_embed_ok)
+        for doc in collection.docs:
+            self.assertEqual(doc.get('content_type'),'health_education')
+            self.assertEqual(doc.get('language'),'zh-TW')
+            self.assertEqual(doc.get('jurisdiction'),'臺灣')
+            self.assertEqual(doc.get('license'),'政府網站資料開放宣告')
+            self.assertEqual(doc.get('license_url'),'https://www.cdc.gov.tw/Category/FPage/TxkBIR9agw_IBRRmvn9TcQ')
+            self.assertIn('衛生福利部疾病管制署',doc.get('attribution',''))
+            self.assertRegex(doc.get('retrieved_at',''),r'^\d{4}-\d{2}-\d{2}T')
+            self.assertRegex(doc.get('content_hash',''),r'^[0-9a-f]{64}$')
+
+    def test_cdc_cannot_carry_fact_check_verdict_even_if_input_has_one(self):
+        a=dict(self.article(),claim='不應帶入的主張',verdict='錯誤',verdict_slug='incorrect')
+        coll,store=FakeCollection(),FakeVectorStore()
+        main_pipeline.upload_to_mongodb([a],coll,vector_store=store,embed_fn=fake_embed_ok)
+        for d in coll.docs:
+            self.assertIsNone(d['claim'])
+            self.assertIsNone(d['verdict'])
+            self.assertIsNone(d['verdict_slug'])
+            self.assertIsNone(store.rows[str(d['_id'])][1])
+
+    def test_same_title_different_urls_are_both_written(self):
+        a=self.article()
+        b=dict(a,url='https://www.cdc.gov.tw/Category/Page/another')
+        other={'url':'https://other.example/same','original_title':a['title'],
+               'chunk_content':'其他來源','chunk_index':1,'total_chunks':1,
+               'chunker_version':_CURRENT_CHUNKER}
+        coll=FakeCollection([other])
+        count,failed=main_pipeline.upload_to_mongodb([a,b],coll,vector_store=FakeVectorStore(),embed_fn=fake_embed_ok)
+        self.assertEqual((count,failed),(2,False))
+        self.assertEqual({d['url'] for d in coll.docs},{a['url'],b['url'],other['url']})
+
+    def test_missing_date_content_change_replaces_only_cdc(self):
+        article=dict(self.article(),updated_at=None)
+        coll,store=FakeCollection(),FakeVectorStore()
+        main_pipeline.upload_to_mongodb([article],coll,vector_store=store,embed_fn=fake_embed_ok)
+        old=set(store.rows)
+        changed=dict(article,content='更新後的預防衛教正文。')
+        count,failed=main_pipeline.upload_to_mongodb([changed],coll,vector_store=store,embed_fn=fake_embed_ok)
+        self.assertEqual((count,failed),(1,False))
+        self.assertTrue(old.isdisjoint(store.rows))
+        self.assertEqual(coll.docs[0]['chunk_content'],'更新後的預防衛教正文。')
+
+    def test_retrieval_time_change_does_not_embed_again(self):
+        article=dict(self.article(),updated_at=None,retrieved_at='2026-10-08T00:00:00+00:00')
+        coll,store,calls=FakeCollection(),FakeVectorStore(),[]
+        def embed(text):
+            calls.append(text)
+            return [0.1,0.2,0.3]
+        main_pipeline.upload_to_mongodb([article],coll,vector_store=store,embed_fn=embed)
+        count=len(calls)
+        second=dict(article,retrieved_at='2026-10-09T00:00:00+00:00')
+        self.assertEqual(main_pipeline.upload_to_mongodb([second],coll,vector_store=store,embed_fn=embed),(0,False))
+        self.assertEqual(len(calls),count)
+        self.assertEqual(coll.docs[0].get('retrieved_at'),second['retrieved_at'])
+
+    def test_legacy_cdc_hash_is_derived_without_reembedding_unchanged_body(self):
+        article=dict(self.article(),updated_at=None)
+        chunks=main_pipeline.chunk_text(article['content'])
+        coll=FakeCollection([{'url':article['url'],'original_title':article['title'],'source_name':article['source'],
+            'chunk_content':chunk,'chunk_index':i+1,'total_chunks':len(chunks),'chunker_version':_CURRENT_CHUNKER}
+            for i,chunk in enumerate(chunks)])
+        calls=[]
+        main_pipeline.upload_to_mongodb([article],coll,vector_store=FakeVectorStore(),embed_fn=lambda text:calls.append(text) or [0.1])
+        self.assertEqual(calls,[])
+        self.assertEqual(coll.docs[0].get('language'),'zh-TW')
+        self.assertRegex(coll.docs[0].get('content_hash',''),r'^[0-9a-f]{64}$')
+
+    def test_legacy_cdc_changed_body_is_not_blessed_with_new_hash(self):
+        article=dict(self.article(),updated_at=None)
+        coll=FakeCollection([{'url':article['url'],'original_title':article['title'],'source_name':article['source'],
+            'chunk_content':'舊正文','chunk_index':1,'total_chunks':1,'chunker_version':_CURRENT_CHUNKER}])
+        self.assertEqual(main_pipeline.upload_to_mongodb([article],coll,vector_store=FakeVectorStore(),embed_fn=fake_embed_ok),(1,False))
+        self.assertEqual(coll.docs[0]['chunk_content'],article['content'])
+
+    def test_non_cdc_sources_keep_existing_no_date_behavior(self):
+        a={'source':'其他来源','url':'https://example.tw/old','title':'其他來源文章','content':'原內容'}
+        coll=FakeCollection()
+        main_pipeline.upload_to_mongodb([a],coll,vector_store=FakeVectorStore(),embed_fn=fake_embed_ok)
+        self.assertEqual(main_pipeline.upload_to_mongodb([dict(a,content='改變內容')],coll,vector_store=FakeVectorStore(),embed_fn=fake_embed_ok),(0,False))
+        self.assertEqual(coll.docs[0]['chunk_content'],'原內容')
+
+    def test_same_date_does_not_replace_the_stored_body_hash(self):
+        a=self.article();coll,store=FakeCollection(),FakeVectorStore()
+        main_pipeline.upload_to_mongodb([a],coll,vector_store=store,embed_fn=fake_embed_ok)
+        original_hash=coll.docs[0]['content_hash']
+        changed=dict(a,content='已改正文但未改可信更新日期')
+        self.assertEqual(main_pipeline.upload_to_mongodb([changed],coll,vector_store=store,embed_fn=fake_embed_ok),(0,False))
+        self.assertEqual(coll.docs[0]['content_hash'],original_hash)
+        self.assertEqual(main_pipeline.upload_to_mongodb([dict(changed,updated_at=None)],coll,vector_store=store,embed_fn=fake_embed_ok),(1,False))
+
+    def test_existing_same_url_from_other_source_is_not_modified(self):
+        from bson import ObjectId
+        a=self.article()
+        old={'_id':ObjectId(),'url':a['url'],'original_title':'人工已收錄','source_name':'人工來源',
+            'chunk_content':'原內容','chunk_index':1,'total_chunks':1,'chunker_version':_CURRENT_CHUNKER}
+        coll=FakeCollection([dict(old)])
+        result=main_pipeline.upload_to_mongodb([a],coll,vector_store=FakeVectorStore(),embed_fn=fake_embed_ok)
+        self.assertEqual(result,(0,False))
+        self.assertEqual(coll.docs[0],old)
+
+    def test_legacy_tracking_url_is_matched_without_reembedding(self):
+        a=self.article();coll,store=FakeCollection(),FakeVectorStore()
+        main_pipeline.upload_to_mongodb([a],coll,vector_store=store,embed_fn=fake_embed_ok)
+        for doc in coll.docs:
+            doc['url']=a['url'].replace('https://','http://')+'?utm_source=old'
+        calls=[]
+        self.assertEqual(main_pipeline.upload_to_mongodb([a],coll,vector_store=store,embed_fn=lambda text:calls.append(text) or [0.1]),(0,False))
+        self.assertEqual(calls,[])
+        self.assertEqual(coll.docs[0]['url'],a['url'])
+
+    def test_equal_hash_still_repairs_incomplete_cdc_article(self):
+        a=dict(self.article(),updated_at=None)
+        coll,store=FakeCollection(),FakeVectorStore()
+        main_pipeline.upload_to_mongodb([a],coll,vector_store=store,embed_fn=fake_embed_ok)
+        coll.docs[0]['total_chunks']=2
+        self.assertEqual(main_pipeline.upload_to_mongodb([a],coll,vector_store=store,embed_fn=fake_embed_ok),(1,False))
+        self.assertEqual(coll.docs[0]['total_chunks'],1)
+
+    def test_failed_cdc_rewrite_keeps_old_hash_and_body(self):
+        a=dict(self.article(),updated_at=None)
+        coll,store=FakeCollection(),FakeVectorStore()
+        main_pipeline.upload_to_mongodb([a],coll,vector_store=store,embed_fn=fake_embed_ok)
+        original=dict(coll.docs[0])
+        main_pipeline.upload_to_mongodb([dict(a,content='新正文')],coll,vector_store=store,embed_fn=lambda text:[])
+        self.assertEqual(coll.docs[0],original)
+
+
+class TestCDCEnablement(unittest.TestCase):
+    def test_cdc_is_disabled_by_default_and_not_a_missing_source(self):
+        articles=[a for a in TestHealthETLPipeline()._all_source_articles() if a['source']!='疾管署疾病介紹']
+        self.assertEqual(main_pipeline.find_missing_sources(articles,env={}),set())
+
+    def test_enabled_cdc_is_independently_monitored(self):
+        articles=[a for a in TestHealthETLPipeline()._all_source_articles() if a['source']!='疾管署疾病介紹']
+        self.assertEqual(main_pipeline.find_missing_sources(articles,env={'CDC_DISEASE_ENABLED':'1'}),{'疾管署疾病介紹'})
+
+    def test_fetcher_switch_and_batch_options(self):
+        from main_pipeline import build_fetchers
+        calls=[]
+        def cdc(**kwargs):
+            calls.append(kwargs)
+            return [{'source':'疾管署疾病介紹'}]
+        self.assertEqual(len(build_fetchers({},cdc_fetcher=cdc)),5)
+        env={'CDC_DISEASE_ENABLED':'true','CDC_DISEASE_MAX_ARTICLES':'5','CDC_DISEASE_START_AT':'10'}
+        enabled=build_fetchers(env,cdc_fetcher=cdc)
+        self.assertEqual(len(enabled),6)
+        self.assertEqual(enabled[-1](),[{'source':'疾管署疾病介紹'}])
+        self.assertEqual(calls,[{'max_articles':5,'start_at':10}])
+
+    def test_job_does_not_require_disabled_cdc(self):
+        articles=[a for a in TestHealthETLPipeline()._all_source_articles() if a['source']!='疾管署疾病介紹']
+        coll=FakeCollection()
+        rc=main_pipeline.job(env={},fetchers=(lambda:articles,),collection_factory=lambda:coll,
+            vector_store_factory=FakeVectorStore,embed_fn=fake_embed_ok)
+        self.assertEqual(rc,0)
+
+
+class TestCDCAccessAndPreview(unittest.TestCase):
+    def helper(self):
+        return TestCDCDiseaseScraper()
+
+    def test_negated_license_terms_stop_before_catalog(self):
+        from scraper_cdc import crawl_cdc, LICENSE_URL, INDEX_URL
+        h = self.helper(); pages = h.pages(); calls = []
+        pages[LICENSE_URL] = pages[LICENSE_URL].replace('重製', '不得重製')
+        def get(url):
+            calls.append(url)
+            return h.response(pages[url], url)
+        result = crawl_cdc(get=get, sleep=lambda _: None)
+        self.assertEqual(result.articles, [])
+        self.assertGreater(result.stats['failed'], 0)
+        self.assertNotIn(INDEX_URL, calls)
+
+    def test_direct_reproduction_restrictions_are_excluded(self):
+        from scraper_cdc import parse_disease_detail, RestrictedContent
+        h = self.helper()
+        for notice in ['本文版權所有，禁止重製。', '本文不得改作。', '本文禁止使用。']:
+            with self.subTest(notice=notice), self.assertRaises(RestrictedContent):
+                parse_disease_detail(h.fixture('detail.html').replace('測試疾病介紹內容。', notice),
+                                     '登革熱', 'https://www.cdc.gov.tw/Category/Page/dengue')
+
+    def test_unknown_query_is_preserved_and_tracking_is_removed(self):
+        from scraper_cdc import _official_url
+        self.assertEqual(_official_url('/Category/Page/test?id=7&utm_source=x&version=2#body','/Category/Page/'),
+            'https://www.cdc.gov.tw/Category/Page/test?id=7&version=2')
+
+    def test_parser_accepts_html_string_and_excludes_restricted_text(self):
+        from scraper_cdc import parse_disease_detail, RestrictedContent
+        html=self.helper().fixture('detail.html')
+        a=parse_disease_detail(html,'登革熱','https://www.cdc.gov.tw/Category/Page/dengue')
+        self.assertEqual(a['language'],'zh-TW')
+        limited=html.replace('測試疾病介紹內容。','本文著作權歸第三方所有，未經同意不得轉載。')
+        with self.assertRaises(RestrictedContent):
+            parse_disease_detail(limited,'登革熱',a['url'])
+
+    def test_site_access_cannot_request_forbidden_or_external_paths(self):
+        from cdc_access import CDCAccess, AccessDenied
+        calls=[]
+        h=self.helper()
+        def get(url):
+            calls.append(url)
+            return h.response(h.fixture('robots.txt'),url)
+        access=CDCAccess(get=get,sleep=lambda seconds:None)
+        for url in ('https://www.cdc.gov.tw/Uploads/a.html','https://evil.test/Category/Page/a',
+                    'https://www.cdc.gov.tw/File/a','https://www.cdc.gov.tw/Category/Page/a?token=SECRET'):
+            with self.subTest(url=url),self.assertRaises(AccessDenied):
+                access.get(url)
+        self.assertEqual(calls,[])
+
+    def test_robots_blocks_an_otherwise_allowed_intro_before_request(self):
+        from cdc_access import CDCAccess, AccessDenied
+        calls=[]
+        h=self.helper()
+        def get(url):
+            calls.append(url)
+            return h.response('User-agent: *\nDisallow: /Category/Page/\nAllow: /Disease/',url)
+        access=CDCAccess(get=get,sleep=lambda seconds:None)
+        access.load_robots()
+        with self.assertRaises(AccessDenied):
+            access.get('https://www.cdc.gov.tw/Category/Page/a')
+        self.assertEqual(calls,['https://www.cdc.gov.tw/robots.txt'])
+
+    def test_redirect_to_external_or_robot_blocked_path_is_not_followed(self):
+        from cdc_access import CDCAccess, AccessDenied
+        h=self.helper()
+        for location in ('https://evil.test/Category/Page/a','/Uploads/a.pdf'):
+            calls=[]
+            def get(url):
+                calls.append(url)
+                if url.endswith('robots.txt'):
+                    return h.response(h.fixture('robots.txt'),url)
+                response=h.response('',url,status=302)
+                response.headers['Location']=location
+                return response
+            access=CDCAccess(get=get,sleep=lambda seconds:None)
+            access.load_robots()
+            with self.subTest(location=location),self.assertRaises(AccessDenied):
+                access.get('https://www.cdc.gov.tw/Category/Page/a')
+            self.assertEqual(len(calls),2)
+
+    def test_request_limit_includes_retries(self):
+        from cdc_access import CDCAccess, RequestLimit
+        h=self.helper();calls=[]
+        def get(url):
+            calls.append(url)
+            return h.response(h.fixture('robots.txt') if url.endswith('robots.txt') else '',url,
+                              status=200 if url.endswith('robots.txt') else 503)
+        access=CDCAccess(get=get,sleep=lambda seconds:None,max_requests=2)
+        access.load_robots()
+        with self.assertRaises(RequestLimit):
+            access.get('https://www.cdc.gov.tw/Disease/Index')
+        self.assertEqual(len(calls),2)
+
+    def test_crawl_limit_and_stats_do_not_fetch_later_diseases(self):
+        from scraper_cdc import crawl_cdc
+        h=self.helper();pages=h.pages();calls=[]
+        def get(url):
+            calls.append(url)
+            return h.response(pages[url],url)
+        result=crawl_cdc(get=get,sleep=lambda seconds:None,max_articles=1)
+        self.assertEqual(result.stats['success'],1)
+        self.assertEqual(result.stats['failed'],0)
+        self.assertEqual(result.stats['next_offset'],1)
+        self.assertNotIn('https://www.cdc.gov.tw/Disease/SubIndex/enterovirus',calls)
+
+    def test_disabled_paths_are_exclusions_not_network_requests(self):
+        from scraper_cdc import crawl_cdc
+        h=self.helper();pages=h.pages();calls=[]
+        pages['https://www.cdc.gov.tw/robots.txt']='User-agent: *\nDisallow: /Category/Page/\n'
+        def get(url):
+            calls.append(url)
+            return h.response(pages[url],url)
+        result=crawl_cdc(get=get,sleep=lambda seconds:None)
+        self.assertEqual(result.articles,[])
+        self.assertEqual(result.stats['excluded'],2)
+        self.assertNotIn('https://www.cdc.gov.tw/Category/Page/dengue',calls)
+
+    def test_empty_index_counts_as_failure(self):
+        from scraper_cdc import crawl_cdc
+        h=self.helper();pages=h.pages()
+        pages['https://www.cdc.gov.tw/Disease/Index']='<h2>版面已變更</h2>'
+        result=crawl_cdc(get=lambda url:h.response(pages[url],url),sleep=lambda seconds:None)
+        self.assertEqual(result.stats['failed'],1)
+        self.assertEqual(result.articles,[])
+
+    def test_safe_redirect_uses_final_url_and_deduplicates_it(self):
+        from scraper_cdc import crawl_cdc
+        h=self.helper();pages=h.pages()
+        original='https://www.cdc.gov.tw/Category/Page/dengue'
+        final='https://www.cdc.gov.tw/Category/Page/enterovirus'
+        def get(url):
+            if url==original:
+                r=h.response('',url,status=302);r.headers['Location']=final;return r
+            return h.response(pages[url],url)
+        result=crawl_cdc(get=get,sleep=lambda seconds:None)
+        self.assertEqual(len(result.articles),1)
+        self.assertEqual(result.articles[0]['url'],final)
+
+    def test_limit_checkpoint_keeps_a_disease_with_remaining_intro_links(self):
+        from scraper_cdc import crawl_cdc
+        h=self.helper();pages=h.pages()
+        url='https://www.cdc.gov.tw/Disease/SubIndex/dengue'
+        pages[url]=pages[url].replace('</body>',
+            '<div class="infectious_disease_box"><div class="disease"><h3 class="disease-heading"><a href="/Category/Page/enterovirus">疾病介紹</a></h3></div></div></body>')
+        result=crawl_cdc(get=lambda url:h.response(pages[url],url),sleep=lambda seconds:None,max_articles=1)
+        self.assertEqual(result.stats['next_offset'],0)
+        self.assertTrue(result.stats['limited'])
+
+    def test_parser_does_not_mutate_input_soup(self):
+        from scraper_cdc import parse_disease_detail
+        soup=BeautifulSoup(self.helper().fixture('detail.html'),'html.parser')
+        before=str(soup)
+        first=parse_disease_detail(soup,'登革熱','https://www.cdc.gov.tw/Category/Page/dengue')
+        second=parse_disease_detail(soup,'登革熱',first['url'])
+        self.assertEqual(str(soup),before)
+        self.assertEqual(first['content_hash'],second['content_hash'])
+
+    def test_policy_unavailable_or_changed_prevents_disease_fetch(self):
+        from scraper_cdc import crawl_cdc
+        h=self.helper();pages=h.pages();calls=[]
+        pages['https://www.cdc.gov.tw/Category/FPage/TxkBIR9agw_IBRRmvn9TcQ']='<h2>授權已變更</h2>'
+        def get(url):
+            calls.append(url)
+            return h.response(pages[url],url)
+        result=crawl_cdc(get=get,sleep=lambda seconds:None)
+        self.assertEqual(result.articles,[])
+        self.assertGreater(result.stats['failed'],0)
+        self.assertNotIn('https://www.cdc.gov.tw/Disease/Index',calls)
+
+    def test_preview_is_json_and_does_not_import_pipeline(self):
+        import subprocess,sys,json
+        code="""import sys,json,scraper_cdc
+from test_system import TestCDCDiseaseScraper
+h=TestCDCDiseaseScraper();pages=h.pages()
+sys.modules.pop('main_pipeline',None)
+def get(url): return h.response(pages[url],url)
+rc=scraper_cdc.main(['--preview','--limit','1'],get=get,sleep=lambda seconds:None)
+assert 'main_pipeline' not in sys.modules
+raise SystemExit(rc)
+"""
+        result=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        payload=json.loads(result.stdout)
+        self.assertEqual(payload['stats']['success'],1)
+        article=payload['articles'][0]
+        self.assertEqual(article['source'],'疾管署疾病介紹')
+        self.assertIn('license',article)
+        self.assertGreater(article['content_length'],0)
+
+    def test_end_of_batch_is_healthy_and_preview_exits_successfully(self):
+        import io,json
+        from scraper_cdc import main,crawl_cdc
+        h=self.helper();pages=h.pages()
+        get=lambda url:h.response(pages[url],url)
+        out=io.StringIO()
+        self.assertEqual(main(['--preview','--offset','2','--limit','1'],get=get,sleep=lambda s:None,stdout=out),0)
+        self.assertTrue(json.loads(out.getvalue())['stats']['exhausted'])
+        result=crawl_cdc(get=get,sleep=lambda s:None,start_at=2)
+        others=[a for a in TestHealthETLPipeline()._all_source_articles() if a['source']!='疾管署疾病介紹']
+        coll=FakeCollection()
+        rc=main_pipeline.job(env={'CDC_DISEASE_ENABLED':'1'},fetchers=(lambda:others,lambda:result),
+            collection_factory=lambda:coll,vector_store_factory=FakeVectorStore,embed_fn=fake_embed_ok)
+        self.assertEqual(rc,0)
+
+    def test_preview_total_failure_returns_nonzero(self):
+        import io,json
+        from scraper_cdc import main
+        out=io.StringIO()
+        def unavailable(url): raise requests.ConnectionError('unavailable')
+        rc=main(['--preview','--limit','1'],get=unavailable,sleep=lambda seconds:None,stdout=out)
+        self.assertEqual(rc,1)
+        self.assertEqual(json.loads(out.getvalue())['stats']['success'],0)
 
 
 if __name__ == '__main__':
